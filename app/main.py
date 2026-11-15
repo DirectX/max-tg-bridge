@@ -1,21 +1,25 @@
 """
-app/main.py
-===========
-Основной режим моста MAX ⇄ Telegram.
+app/main.py  (v2)
+=================
+Точка сборки Multi-Account & Role-Based Bridge.
 
-Запуск:  python -m app.main   (в контейнере — CMD по умолчанию)
+     ┌─────────────┐   fanout    ┌──────────┐   ┌──────────────────┐
+     │ MAX worker 1│────────────►│          │   │ Владелец 1 ( reply→MAX )
+     │ MAX worker 2│────────────►│ Telegram │──►│ Слушатели …      │
+     │ MAX worker N│───┐         │ Core     │   └──────────────────┘
+     └─────────────┘   │         │ (proxy)  │──► Админ: /admin-панель
+              ▲        │         └──────────┘        ▲   ▲
+              │        ▼                             │   │
+        AccountManager ◄──────── FSM-авторизация ────┘───┘
+        (супервизоры, изоляция падений)
 
-Порядок старта:
-    1. загрузка конфигурации из ENV;
-    2. Telegram-бот (через ваш Nginx-реверс api.telegram.org);
-    3. Chromium с persistent-профилем -> web.max.ru -> целевой чат;
-    4. в ленту чата внедряется JS-мост, история помечается «переданной»;
-    5. запускаются задачи: MAX-поллер, воркер, TG-polling, watchdog,
-       ночная перезагрузка;
-    6. SIGTERM/SIGINT — корректное завершение (сохранение профиля, стоп бота).
+Порядок включения роутеров ВАЖЕН:
+    1) auth_router  — состояния AuthFlow (перехватывают ввод телефона/кода);
+    2) admin_router — /admin, колбэки, AdminInput;
+    3) user_router  — catch-all личных сообщений (последним!).
 
-Любая фатальная ошибка (протухшая сессия MAX, умерший Chromium) приводит к
-выходу с кодом 1 — docker `restart: unless-stopped` всё поднимет заново.
+SIGTERM/SIGINT: останавливаем супервизоров (браузеры корректно закрывают
+профили), затем Telegram, затем SQLite. docker restart поднимет всё сам.
 """
 
 from __future__ import annotations
@@ -25,119 +29,79 @@ import contextlib
 import signal
 import sys
 
-from .bridge import Bridge
-from .browser import BrowserManager
+from aiogram import Router
+
+from .account_manager import AccountManager
 from .config import load_config
-from .max_dom import MaxAuthError, MaxWeb
 from .store import Store
-from .telegram_bot import TelegramBridge
+from .tg import admin_handlers, auth_fsm, user_handlers
+from .tg.bot import TelegramCore
 from .utils import get_logger, setup_logging
 
 log = get_logger("main")
 
 
-class BridgeRuntime:
+class Runtime:
     def __init__(self) -> None:
-        self.cfg = load_config()
+        self.cfg = load_config(require_admin=True)
         self.store = Store(self.cfg.db_path)
-        self.tg = TelegramBridge(self.cfg)
-        self.browser = BrowserManager(self.cfg)
-        self.max: MaxWeb | None = None
-        self.bridge: Bridge | None = None
-        self._tasks: list[asyncio.Task] = []
+        self.tg = TelegramCore(self.cfg)
+        self.mgr = AccountManager(self.cfg, self.store, self.tg)
         self._shutdown = asyncio.Event()
+        self._polling: asyncio.Task | None = None
 
-    # ------------------------------------------------------------------
     async def run(self) -> None:
+        # ---- роутеры (порядок обязателен) --------------------------------
+        auth_router = Router()
+        auth = auth_fsm.register(auth_router, self.cfg, self.store, self.tg, self.mgr)
+
+        admin_router = Router()
+        admin_handlers.register(admin_router, self.cfg, self.store, self.tg,
+                                self.mgr, auth)
+
+        user_router = Router()
+        user_handlers.register(user_router, self.cfg, self.store, self.tg, self.mgr)
+
+        self.tg.dp.include_router(auth_router)
+        self.tg.dp.include_router(admin_router)
+        self.tg.dp.include_router(user_router)
+
+        # ---- старт --------------------------------------------------------
         await self.tg.prepare()
+        await self.mgr.start_all()
 
-        await self.browser.start()
-        self.max = MaxWeb(self.browser.page, self.cfg)
-
-        try:
-            await self.max.open_max()
-            await self.max.open_target_chat()
-        except MaxAuthError as exc:
-            log.error("MAX не авторизован: %s", exc)
-            await self.tg.notify(
-                f"⛔ MAX требует авторизации: {exc}\n"
-                "Выполните: docker compose run --rm bridge python -m app.auth"
-            )
-            raise SystemExit(1)
-
-        self.bridge = Bridge(self.cfg, self.browser, self.max, self.tg, self.store)
-        self.tg.on_incoming = self.bridge.on_telegram_incoming
-
-        async def _on_command(cmd: str) -> str:
-            assert self.bridge is not None
-            return self.bridge.status_report() if cmd == "status" else "?"
-
-        self.tg.on_command = _on_command
-
-        self._spawn(self.bridge.max_poller(), "max_poller")
-        self._spawn(self.bridge.max_worker(), "max_worker")
-        self._spawn(self.bridge.watchdog(), "watchdog")
-        self._spawn(self.bridge.nightly_reload(), "nightly_reload")
-        self._spawn(self.tg.run_polling(), "tg_polling")
-
-        await self.tg.notify(
-            f"🟢 Мост поднят. {self.bridge.status_report()}\n"
-            f"Чат MAX: {self.cfg.max_chat_title or self.cfg.max_chat_url}"
-        )
-        log.info("Мост работает. /status — сводка, SIGTERM — graceful shutdown")
+        self._polling = asyncio.create_task(self.tg.run_polling(), name="tg_polling")
+        log.info("Мост v2 работает. Аккаунтов в работе: %s",
+                 self.mgr.running_ids())
         await self._shutdown.wait()
 
-    def _spawn(self, coro, name: str) -> None:
-        async def runner() -> None:
-            try:
-                await coro
-            except asyncio.CancelledError:
-                log.info("Задача %s отменена", name)
-                raise
-            except MaxAuthError as exc:
-                log.error("Фатальная ошибка авторизации MAX в %s: %s", name, exc)
-                with contextlib.suppress(Exception):
-                    await self.tg.notify(f"⛔ {name}: сессия MAX истекла — нужен app.auth")
-                self._request_shutdown()
-            except Exception:  # noqa: BLE001
-                log.exception("Задача %s упала — останавливаюсь, docker рестартует контейнер", name)
-                self._request_shutdown()
-
-        self._tasks.append(asyncio.create_task(runner(), name=name))
-
-    def _request_shutdown(self) -> None:
+    def request_shutdown(self) -> None:
         self._shutdown.set()
 
-    # ------------------------------------------------------------------
     async def shutdown(self) -> None:
         log.info("Останавливаюсь…")
-        if self.bridge:
-            self.bridge.stop()
-        for t in self._tasks:
-            t.cancel()
-        for t in self._tasks:
+        if self._polling:
+            self._polling.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await t
-        with contextlib.suppress(Exception):
-            await self.tg.notify("🛑 Мост остановлен (см. логи контейнера)")
-        await self.browser.stop()
+                await self._polling
+        await self.mgr.shutdown()
         await self.tg.close()
         self.store.close()
-        log.info("Все ресурсы освобождены, пока! 🦪")
+        log.info("Все ресурсы освобождены")
 
 
-def _install_signal_handlers(runtime: BridgeRuntime) -> None:
+def _install_signal_handlers(runtime: Runtime) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, runtime._request_shutdown)
+            loop.add_signal_handler(sig, runtime.request_shutdown)
 
 
 async def amain() -> int:
     setup_logging()
     try:
-        runtime = BridgeRuntime()
-    except SystemExit as exc:  # ошибки конфигурации из load_config
+        runtime = Runtime()
+    except SystemExit as exc:      # ошибки конфигурации из load_config
         print(exc)
         return int(exc.code or 1)
     _install_signal_handlers(runtime)

@@ -1,26 +1,21 @@
 """
-app/max_dom.py
-==============
-Адаптер к DOM веб-клиента MAX (web.max.ru). Всё, что знает про верстку MAX,
-живёт здесь + в app/selectors.py.
+app/max_dom.py  (v2)
+====================
+Адаптер к DOM веб-клиента MAX (web.max.ru) для ОДНОЙ вкладки одного аккаунта.
 
-Архитектура чтения сообщений:
-    В страницу инжектируется JS-мост `window.__MaxBridge`:
-      * MutationObserver по документу ленты + страховочный интервал-скан;
-      * каждый найденный «якорь» (текст/картинка сообщения) поднимается до
-        границы одного сообщения (пока родитель не начнёт содержать >1 якорь);
-      * по устойчивому ключу (data-message-id либо хэш отправитель+текст+время)
-        дедуплицирует внутри страницы;
-      * новые сообщения складывает в память страницы (queue), Python забирает
-        их коротким `drain()` раз в MAX_POLL_INTERVAL секунд (чтение памяти —
-        это НЕ сетевой polling, нагрузка на MAX нулевая).
+v2 отличия от v1:
+  * MaxWeb привязан к конкретному аккаунту: параметры чата/самоимени/лимита
+    картинок приходят в AccountTarget (не из глобального ENV);
+  * добавлены «шаги логина» (goto_home/submit_phone/submit_code/wait_logged_in/
+    detect_captcha/screenshot) — переиспользуются и CLI app.auth, и
+    интерактивной FSM авторизации через Telegram;
+  * JS-мост чтения (_JS_BRIDGE) НЕ изменялся — покрыт tests/test_max_dom_bridge.js.
 
-Скачивание картинок: fetch() выполняется ВНУТРИ страницы, поэтому браузер
-сам подставляет куки/авторизацию MAX, а blob:-URLы ресурсодоступны только
-изнутри вкладки. Результат — base64 -> io.BytesIO -> bot.send_photo.
-
-ВСЕ селекторы берутся из app/selectors.py — правки верстки не должны
-требовать изменений здесь.
+Архитектура чтения (как в v1): в страницу инжектируется window.__MaxBridge
+(MutationObserver + interval-скан + дедуп по ключу), Python забирает drain().
+Картинки скачиваются fetch() ВНУТРИ страницы (blob:-URL и авторизационные
+куки живут только там); фолбэк — скриншот элемента.
+ВСЕ селекторы — из app/selectors.py.
 """
 
 from __future__ import annotations
@@ -28,6 +23,8 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 
 from playwright.async_api import Error as PWError
 from playwright.async_api import Locator, Page, TimeoutError as PWTimeout
@@ -40,11 +37,26 @@ log = get_logger("max.dom")
 
 
 class MaxAuthError(RuntimeError):
-    """Сессия MAX протуха: требуется повторный `python -m app.auth`."""
+    """Сессия MAX протухла: требуется переавторизация аккаунта."""
 
 
 class MaxChatNotFound(RuntimeError):
-    """Не найден/не открылся целевой чат — проверьте MAX_CHAT_TITLE/URL."""
+    """Не найден/не открылся целевой чат — проверьте настройки аккаунта."""
+
+
+@dataclass(slots=True)
+class AccountTarget:
+    """Всё, что MaxWeb должен знать про конкретный аккаунт."""
+    account_id: int
+    chat_title: str = ""
+    chat_url: str = ""
+    self_name: str = ""
+    tmp_dir: Path = Path("/data/tmp")
+    max_image_bytes: int = 9 * 1024 * 1024
+
+    @property
+    def label(self) -> str:
+        return f"a{self.account_id}"
 
 
 @dataclass(slots=True)
@@ -56,17 +68,18 @@ class MaxImage:
 
 @dataclass(slots=True)
 class MaxMessage:
-    key: str                       # устойчивый id для дедупликации
+    key: str
     sender: str
     text: str
     images: list[MaxImage] = field(default_factory=list)
-    mine: bool = False             # исходящее (моё) — для защиты от эхо-петли
-    ts: int = 0                    # мс по часам страницы
+    mine: bool = False
+    ts: int = 0
 
 
-# ---------------------------------------------------------------------------
-# JS-мост, инжектируемый в страницу
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# JS-мост, инжектируемый в страницу (ИЗМЕНЯТЬСЯ ТОЛЬКО ВМЕСТЕ С ТЕСТОМ:
+# tests/run_js_bridge_test.sh)
+# ===========================================================================
 _JS_BRIDGE = r"""
 (() => {
   'use strict';
@@ -283,7 +296,6 @@ async ([src, maxBytes]) => {
 """
 
 # Находит бокс <img> по src, скроллит в центр и отдаёт координаты
-# (fallback: скриншот кусочка страницы, если fetch не пропустили CSP)
 _JS_IMG_BOX = r"""
 async (src) => {
   const imgs = Array.prototype.slice.call(document.images);
@@ -303,15 +315,18 @@ def _css_only(selectors: list[str]) -> list[str]:
     return [s for s in selectors if ":has-text" not in s and ">>" not in s]
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 
 class MaxWeb:
-    """Одна вкладка web.max.ru: вход в чат, чтение, отправка."""
+    """Одна вкладка web.max.ru конкретного аккаунта MAX."""
 
-    def __init__(self, page: Page, cfg: Config) -> None:
+    def __init__(self, page: Page, cfg: Config, acct: AccountTarget) -> None:
         self.page = page
         self.cfg = cfg
+        self.acct = acct
+        self.label = acct.label
+        self._log = get_logger(f"max.dom.{self.label}")
         self._bridge_installed = False
 
     # ---------------------------------------------------------------- utils
@@ -326,7 +341,7 @@ class MaxWeb:
             "idAttrs": S.MESSAGE_ID_ATTRS,
             "mineMarkers": S.MINE_MARKERS,
             "systemMarkers": S.IGNORE_SYSTEM_MARKERS,
-            "selfName": self.cfg.max_self_name,
+            "selfName": self.acct.self_name,
         }
 
     async def _first(self, candidates: list[str], root: Page | Locator | None = None,
@@ -347,74 +362,27 @@ class MaxWeb:
         except PWError:
             return self.page.url
 
-    # ------------------------------------------------------------ lifecycle
-    async def open_max(self) -> None:
-        log.info("Открываю %s", self.cfg.max_url)
-        await self.page.goto(self.cfg.max_url, wait_until="domcontentloaded", timeout=90_000)
-        # SPA-приложению нужно время на boot + авторизацию по cookies
-        marker = await self._first(S.CHAT_OPENED_MARKERS, timeout_ms=25_000, state="attached")
-        if marker is None:
-            url = await self.current_url()
-            raise MaxAuthError(
-                "MAX не показывает авторизованный интерфейс "
-                f"(url={url}). Выполните первичный вход: docker compose run --rm "
-                "bridge python -m app.auth"
-            )
+    async def screenshot(self, kind: str) -> Path:
+        """Скриншот в cfg.screenshots_dir; путь возвращаем для отправки в TG."""
+        self.cfg.screenshots_dir.mkdir(parents=True, exist_ok=True)
+        path = self.cfg.screenshots_dir / (
+            f"auth_{self.label}_{kind}_{datetime.now():%H%M%S}.png"
+        )
+        try:
+            await self.page.screenshot(path=str(path), full_page=False)
+        except PWError as exc:
+            self._log.warning("Скриншот не сделан: %s", exc)
+            raise
+        return path
 
-    async def open_target_chat(self) -> None:
-        """Открывает чат по MAX_CHAT_URL либо поиск => MAX_CHAT_TITLE."""
-        if await self._looks_like_login():
-            raise MaxAuthError("Редирект на страницу входа — сессия MAX истекла.")
-
-        if self.cfg.max_chat_url:
-            log.info("Открываю чат по URL: %s", self.cfg.max_chat_url)
-            await self.page.goto(self.cfg.max_chat_url, wait_until="domcontentloaded")
-        else:
-            await self._open_chat_by_search(self.cfg.max_chat_title)
-
-        composer = await self._first(S.CHAT_OPENED_MARKERS, timeout_ms=20_000)
-        if composer is None:
-            raise MaxChatNotFound(
-                f"Чат {self.cfg.max_chat_title!r} не открылся: проверьте "
-                "MAX_CHAT_TITLE / MAX_CHAT_URL и актуальность CHAT_OPENED_MARKERS."
-            )
-        await self.page.evaluate(_JS_BRIDGE)
-        await self.page.evaluate("(cfg) => window.__MaxBridge.install(cfg)", self._js_config())
-        seeded = await self.page.evaluate("() => window.__MaxBridge.seed()")
-        self._bridge_installed = True
-        log.info("Целевой чат открыт, история из %d сообщений помечена как переданная", seeded)
-
-    async def _open_chat_by_search(self, title: str) -> None:
-        if not title:
-            raise MaxChatNotFound("Не задан ни MAX_CHAT_URL, ни MAX_CHAT_TITLE")
-        log.info("Ищу чат %r через поиск", title)
-
-        # Поле поиска может быть сразу на странице — иначе кликаем триггер.
-        box = await self._first(S.SEARCH_INPUT, timeout_ms=2_500)
-        if box is None:
-            trigger = await self._first(S.SEARCH_TRIGGER, timeout_ms=5_000)
-            if trigger is None:
-                raise MaxChatNotFound("Не нашёл поле/иконку поиска (SEARCH_TRIGGER/INPUT).")
-            await trigger.click()
-            await jitter(0.4, 0.8)
-            box = await self._first(S.SEARCH_INPUT, timeout_ms=8_000)
-        if box is None:
-            raise MaxChatNotFound("Поиск открылся, но поле ввода не найдено.")
-
-        await box.click()
-        await box.fill("")
-        await box.press_sequentially(title, delay=90)
-        await jitter(1.2, 2.2)  # даём отрисоваться результатам
-
-        item_sel = [t.format(title=title) for t in S.CHAT_ITEM]
-        item = await self._first(item_sel, timeout_ms=10_000)
-        if item is None:
-            raise MaxChatNotFound(
-                f"В поиске нет строки с чатом {title!r}. Уточните MAX_CHAT_TITLE "
-                "или возьмите точное название из шапки чата."
-            )
-        await item.click()
-        await jitter(0.8, 1.6)
+    async def detect_captcha(self) -> bool:
+        for sel in S.CAPTCHA_MARKERS:
+            try:
+                if await self.page.locator(sel).first.count() > 0:
+                    return True
+            except PWError:
+                continue
+        return False
 
     async def _looks_like_login(self) -> bool:
         url = await self.current_url()
@@ -422,6 +390,137 @@ class MaxWeb:
             return True
         phone = await self._first(S.PHONE_INPUT, timeout_ms=800, state="attached")
         return phone is not None
+
+    # ------------------------------------------------------- шаги логина
+    # Используются app/auth_fsm.py (через Telegram) и app/auth.py (CLI).
+    async def goto_home(self) -> str:
+        """Открывает MAX и определяет состояние: 'logged_in' | 'login_form' | 'unknown'."""
+        await self.page.goto(self.cfg.max_url, wait_until="domcontentloaded", timeout=90_000)
+        await jitter(2.0, 3.5)
+        phone = await self._first(S.PHONE_INPUT, timeout_ms=6_000, state="attached")
+        if phone is not None:
+            return "login_form"
+        marker = await self._first(S.LOGGED_IN_MARKERS, timeout_ms=12_000, state="attached")
+        return "logged_in" if marker is not None else "unknown"
+
+    async def submit_phone(self, phone: str) -> tuple[Path, bool]:
+        """Вводит номер, жмёт «Далее». Возвращает (скриншот, captcha?)."""
+        phone_input = await self._first(S.PHONE_INPUT, timeout_ms=15_000)
+        if phone_input is None:
+            shot = await self.screenshot("no_phone_input")
+            raise RuntimeError(
+                "Поле ввода телефона не найдено (селекторы PHONE_INPUT) — "
+                f"скриншот: {shot.name}"
+            )
+        await phone_input.click()
+        await phone_input.fill("")
+        await phone_input.press_sequentially(phone, delay=110)
+        await jitter(0.6, 1.4)
+
+        submit = await self._first(S.PHONE_SUBMIT_BUTTON, timeout_ms=5_000)
+        if submit is not None:
+            await submit.click()
+        else:
+            await self.page.keyboard.press("Enter")
+        await jitter(1.5, 2.5)
+        shot = await self.screenshot("after_phone")
+        return shot, await self.detect_captcha()
+
+    async def submit_code(self, code: str) -> tuple[Path, bool]:
+        """Вводит СМС-код в активное поле. Возвращает (скриншот, captcha?)."""
+        code_input = await self._first(S.SMS_INPUT, timeout_ms=20_000)
+        if code_input is not None:
+            try:
+                await code_input.click()
+            except (PWError, PWTimeout):
+                pass  # поле может быть «невидимым» — печатаем в фокус
+        await jitter(0.3, 0.6)
+        await self.page.keyboard.type(code, delay=140)
+        await jitter(0.5, 1.0)
+
+        submit = await self._first(S.SMS_SUBMIT_BUTTON, timeout_ms=3_000)
+        if submit is not None:
+            try:
+                await submit.click()
+            except (PWError, PWTimeout):
+                await self.page.keyboard.press("Enter")
+        else:
+            await self.page.keyboard.press("Enter")
+        await jitter(1.5, 2.5)
+        shot = await self.screenshot("after_code")
+        return shot, await self.detect_captcha()
+
+    async def wait_logged_in(self, timeout_s: float = 90) -> bool:
+        marker = await self._first(
+            S.LOGGED_IN_MARKERS, timeout_ms=int(timeout_s * 1000), state="attached"
+        )
+        return marker is not None
+
+    # ------------------------------------------------------------ рабочий цикл
+    async def open_max(self) -> None:
+        """Боевой вход: страница должна открыться УЖЕ авторизованной."""
+        self._log.info("Открываю %s", self.cfg.max_url)
+        await self.page.goto(self.cfg.max_url, wait_until="domcontentloaded",
+                             timeout=90_000)
+        marker = await self._first(S.CHAT_OPENED_MARKERS, timeout_ms=25_000, state="attached")
+        if marker is None:
+            url = await self.current_url()
+            raise MaxAuthError(
+                f"[{self.label}] MAX не показывает авторизованный интерфейс (url={url})"
+            )
+
+    async def open_target_chat(self) -> None:
+        """Открывает чат аккаунта по chat_url либо через поиск по chat_title."""
+        if await self._looks_like_login():
+            raise MaxAuthError(f"[{self.label}] редирект на страницу входа — сессия истекла")
+
+        if self.acct.chat_url:
+            self._log.info("Открываю чат по URL: %s", self.acct.chat_url)
+            await self.page.goto(self.acct.chat_url, wait_until="domcontentloaded")
+        else:
+            await self._open_chat_by_search(self.acct.chat_title)
+
+        composer = await self._first(S.CHAT_OPENED_MARKERS, timeout_ms=20_000)
+        if composer is None:
+            raise MaxChatNotFound(
+                f"[{self.label}] чат {self.acct.chat_title!r} не открылся: проверьте "
+                "название/URL и селекторы CHAT_OPENED_MARKERS"
+            )
+        await self.page.evaluate(_JS_BRIDGE)
+        await self.page.evaluate("(cfg) => window.__MaxBridge.install(cfg)", self._js_config())
+        seeded = await self.page.evaluate("() => window.__MaxBridge.seed()")
+        self._bridge_installed = True
+        self._log.info("Целевой чат открыт, history seed=%d", seeded)
+
+    async def _open_chat_by_search(self, title: str) -> None:
+        if not title:
+            raise MaxChatNotFound(f"[{self.label}] не заданы ни chat_url, ни chat_title")
+        self._log.info("Ищу чат %r через поиск", title)
+
+        box = await self._first(S.SEARCH_INPUT, timeout_ms=2_500)
+        if box is None:
+            trigger = await self._first(S.SEARCH_TRIGGER, timeout_ms=5_000)
+            if trigger is None:
+                raise MaxChatNotFound(f"[{self.label}] не нашёл поле/иконку поиска")
+            await trigger.click()
+            await jitter(0.4, 0.8)
+            box = await self._first(S.SEARCH_INPUT, timeout_ms=8_000)
+        if box is None:
+            raise MaxChatNotFound(f"[{self.label}] поиск открылся, но поля ввода нет")
+
+        await box.click()
+        await box.fill("")
+        await box.press_sequentially(title, delay=90)
+        await jitter(1.2, 2.2)
+
+        item_sel = [t.format(title=title) for t in S.CHAT_ITEM]
+        item = await self._first(item_sel, timeout_ms=10_000)
+        if item is None:
+            raise MaxChatNotFound(
+                f"[{self.label}] в поиске нет строки с чатом {title!r}"
+            )
+        await item.click()
+        await jitter(0.8, 1.6)
 
     # -------------------------------------------------------------- reading
     async def poll(self) -> list[MaxMessage]:
@@ -431,7 +530,6 @@ class MaxWeb:
         try:
             raw = await self.page.evaluate("() => window.__MaxBridge.drain()")
         except PWError:
-            # страница перезагружается (daily reload) — переинсталируем мост
             self._bridge_installed = False
             raise
         out: list[MaxMessage] = []
@@ -460,12 +558,10 @@ class MaxWeb:
         await self.page.evaluate("(cfg) => window.__MaxBridge.install(cfg)", self._js_config())
         seeded = await self.page.evaluate("() => window.__MaxBridge.seed()")
         self._bridge_installed = True
-        log.info("JS-мост переустановлен после перезагрузки (seed=%d)", seeded)
+        self._log.info("JS-мост переустановлен (seed=%d)", seeded)
 
     async def ensure_listening(self) -> bool:
-        """Лёгкая самопроверка: жив ли JS-мост в странице. Если SPA перемонтировал
-        документ/страница перезагрузилась — переинсталирует. Возвращает True,
-        если слушатель активен."""
+        """Жив ли JS-мост в странице; при потере — переинсталирует."""
         if self._bridge_installed:
             try:
                 ok = await self.page.evaluate(
@@ -473,14 +569,14 @@ class MaxWeb:
                 )
                 if ok:
                     return True
-                log.warning("__MaxBridge исчез из страницы — переустанавливаю")
+                self._log.warning("__MaxBridge исчез — переустанавливаю")
             except PWError:
                 self._bridge_installed = False
         try:
             await self.rearm_bridge()
             return True
         except Exception as exc:  # noqa: BLE001
-            log.warning("Переустановить JS-мост не удалось (%s) — watchdog подстрахует", exc)
+            self._log.warning("Переустановка моста не удалась: %s — watchdog подстрахует", exc)
             return False
 
     async def health(self) -> bool:
@@ -498,28 +594,27 @@ class MaxWeb:
 
     # ------------------------------------------------------------- images
     async def download_image(self, src: str) -> bytes | None:
-        """Возвращает байты картинки; None — не скачалось (упадёт тихо)."""
-        cfg = self.cfg
+        cfg_lim = self.acct.max_image_bytes
         if src.startswith("data:"):
             try:
-                header, b64 = src.split(",", 1)
-                if len(b64) * 3 / 4 > cfg.max_image_bytes:
-                    log.warning("data:-картинка слишком большая")
+                _, b64 = src.split(",", 1)
+                if len(b64) * 3 / 4 > cfg_lim:
+                    self._log.warning("data:-картинка слишком большая")
                     return None
                 return base64.b64decode(b64)
             except Exception as exc:  # noqa: BLE001
-                log.warning("Не распарсил data-URL: %s", exc)
+                self._log.warning("Не распарсил data-URL: %s", exc)
                 return None
 
-        res = await self.page.evaluate(_JS_FETCH_IMAGE, [src, cfg.max_image_bytes])
+        res = await self.page.evaluate(_JS_FETCH_IMAGE, [src, cfg_lim])
         if isinstance(res, dict) and res.get("ok"):
             try:
                 return base64.b64decode(res["b64"])
             except Exception as exc:  # noqa: BLE001
-                log.warning("base64-декод картинки упал: %s", exc)
+                self._log.warning("base64-декод упал: %s", exc)
 
-        log.info("fetch картинки не удался (%s) — пробую скриншот <img>",
-                 (res or {}).get("error", "?") if isinstance(res, dict) else res)
+        self._log.info("fetch картинки не удался (%s) — пробую скриншот <img>",
+                       (res or {}).get("error", "?") if isinstance(res, dict) else res)
         return await self._screenshot_image(src)
 
     async def _screenshot_image(self, src: str) -> bytes | None:
@@ -528,14 +623,15 @@ class MaxWeb:
             if not box:
                 return None
             png = await self.page.screenshot(clip=box, type="png", timeout=15_000)
-            if len(png) > self.cfg.max_image_bytes:
-                log.warning("Скриншот картинки больше лимита — пропускаю")
+            if len(png) > self.acct.max_image_bytes:
+                self._log.warning("Скриншот картинки больше лимита")
                 return None
             return png
         except (PWError, PWTimeout) as exc:
-            log.warning("Скриншот картинки не вышел: %s", exc)
+            self._log.warning("Скриншот картинки не вышел: %s", exc)
             return None
 
+    # ------------------------------------------------------------- writing
     async def _submit(self) -> None:
         """Enter + подстраховка кнопкой «Отправить», если SPA не перехватила Enter."""
         await self.page.keyboard.press("Enter")
@@ -554,22 +650,17 @@ class MaxWeb:
             if leftover:
                 send_btn = await self._first(S.SEND_BUTTON, timeout_ms=2_000)
                 if send_btn is not None:
-                    log.info("Enter не сработал — жму кнопку отправки")
+                    self._log.info("Enter не сработал — жму кнопку отправки")
                     await send_btn.click()
         except (PWError, PWTimeout):
             pass
 
-    # ------------------------------------------------------------- writing
     async def send_text(self, text: str) -> None:
-        """Печатает текст посимвольно (антифрод) и отправляет Enter'ом.
-
-        Переводы строк внутри текста отправляются как Shift+Enter,
-        чтобы не «спалить» отправление раньше времени.
-        """
+        """Печатает посимвольно (антифрод); переводы строк — Shift+Enter."""
         await human_pause()
         composer = await self._first(S.COMPOSER, timeout_ms=10_000)
         if composer is None:
-            raise RuntimeError("Поле ввода сообщения не найдено (COMPOSER).")
+            raise RuntimeError(f"[{self.label}] поле ввода сообщения не найдено (COMPOSER)")
 
         await composer.click()
         await jitter(0.25, 0.6)
@@ -587,23 +678,22 @@ class MaxWeb:
 
     async def send_photo(self, data: bytes, caption: str = "",
                          filename: str = "tg_photo.jpg") -> None:
-        """Сохраняет байты во временную директорию (tmp_dir, удобно для
-        отладки) и загружает файл в чат MAX через input[type=file]."""
+        """Байты -> временная папка аккаунта -> input[type=file] -> подпись -> Enter."""
         from uuid import uuid4
 
         safe = "".join(c for c in filename if c.isalnum() or c in "._-")[:64] or "photo.png"
-        path = self.cfg.tmp_dir / f"{uuid4().hex[:8]}_{safe}"
+        path = self.acct.tmp_dir / f"a{self.acct.account_id}_{uuid4().hex[:8]}_{safe}"
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
         try:
             await self._upload_and_send(path, caption)
         finally:
             try:
-                path.unlink(missing_ok=True)  # не копить мусор в tmp
+                path.unlink(missing_ok=True)
             except OSError:
                 pass
 
     async def _upload_and_send(self, path, caption: str = "") -> None:
-        """Загрузка файла в чат MAX через input[type=file] + подпись + Enter."""
         await human_pause()
         file_input: Locator | None = None
         for sel in S.FILE_INPUT:
@@ -619,13 +709,15 @@ class MaxWeb:
             try:
                 await file_input.set_input_files(str(path))
             except PWError as exc:
-                log.warning("set_input_files не сработал (%s), пробую через кнопку «Прикрепить»", exc)
+                self._log.warning(
+                    "set_input_files не сработал (%s), пробую кнопку «Прикрепить»", exc)
                 file_input = None
 
         if file_input is None:
             attach = await self._first(S.ATTACH_BUTTON, timeout_ms=5_000)
             if attach is None:
-                raise RuntimeError("Не найден ни input[type=file], ни кнопка «Прикрепить».")
+                raise RuntimeError(
+                    f"[{self.label}] нет ни input[type=file], ни кнопки «Прикрепить»")
             async with self.page.expect_file_chooser(timeout=10_000) as fc_info:
                 await attach.click()
             chooser = await fc_info.value
@@ -633,7 +725,7 @@ class MaxWeb:
 
         preview = await self._first(S.ATTACH_PREVIEW, timeout_ms=20_000, state="attached")
         if preview is None:
-            log.warning("Превью вложения не дождался — всё равно пробую отправить")
+            self._log.warning("Превью вложения не дождался — всё равно пробую отправить")
         await human_pause(1.0, 2.0)
 
         if caption:
@@ -650,12 +742,7 @@ class MaxWeb:
         await composer.press_sequentially(caption[:900], delay=60)
 
     async def reply_text(self, quoted_preview: str, text: str) -> bool:
-        """Best-effort ответ на конкретное сообщение; False -> вызывающий
-        отправит обычное сообщение с цитатой текстом.
-
-        Ищем текст-якорь, поднимаемся к «пузырьку» сообщения, наводим мышь
-        (у MAX контролы сообщения появляются на hover) и жмём «Ответить».
-        """
+        """Best-effort «Ответить» на сообщение; False -> вызывающий шлёт цитатой."""
         try:
             snippet = (quoted_preview or "")[:60].strip()
             if len(snippet) < 3:
@@ -664,8 +751,6 @@ class MaxWeb:
             anchor = self.page.locator(f"text={text_sel}").last
             await anchor.scroll_into_view_if_needed(timeout=5_000)
 
-            # Пузырьк сообщения: ближайший предок, внутри которого есть
-            # контрол ответа. Поднимаемся максимум на 6 уровней.
             node = anchor
             control = None
             for _ in range(6):
@@ -684,31 +769,29 @@ class MaxWeb:
             await self.send_text(text)
             return True
         except (PWError, PWTimeout) as exc:
-            log.info("Reply через UI не вышел (%s) — отправлю отдельным сообщением", exc)
+            self._log.info("Reply через UI не вышел (%s) — уйдёт отдельным сообщением", exc)
             return False
 
     async def reload_page(self) -> None:
-        log.info("Суточная мягкая перезагрузка страницы MAX…")
+        self._log.info("Мягкая перезагрузка страницы MAX…")
         await self.page.reload(wait_until="domcontentloaded", timeout=120_000)
         await self.open_target_chat_silently()
 
     async def open_target_chat_silently(self) -> None:
-        """Переокрытие чата после reload без выбрасывания ошибок наружу."""
         try:
             marker = await self._first(S.CHAT_OPENED_MARKERS, timeout_ms=20_000)
-            if marker is None and self.cfg.max_chat_url:
-                await self.page.goto(self.cfg.max_chat_url, wait_until="domcontentloaded")
+            if marker is None and self.acct.chat_url:
+                await self.page.goto(self.acct.chat_url, wait_until="domcontentloaded")
             elif marker is None:
-                await self._open_chat_by_search(self.cfg.max_chat_title)
+                await self._open_chat_by_search(self.acct.chat_title)
             await self._first(S.CHAT_OPENED_MARKERS, timeout_ms=20_000)
             await self.rearm_bridge()
         except Exception as exc:  # noqa: BLE001
-            log.error("После reload не удалось переоткрыть чат: %s", exc)
+            self._log.error("После reload чат не переоткрыт: %s", exc)
             self._bridge_installed = False
 
     async def keepalive(self) -> None:
-        """Имитирует «живую» вкладку: MAX по visibility/фокусу может закрывать
-        websocket, периодически «будим» страницу невидимыми событиями."""
+        """«Будим» страницу: SPA мессенджера закрывает ws на фоновых вкладках."""
         try:
             await self.page.evaluate(
                 """() => {

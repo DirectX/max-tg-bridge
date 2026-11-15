@@ -1,9 +1,10 @@
 .env
 data/
-chrome_profile/
 __pycache__/
 *.pyc
 .venv/
 venv/
-
 .test_js_bridge.js
+tests/__pycache__/
+
+.verify/work/

@@ -14,6 +14,7 @@ import re
 import sys
 import time
 from collections.abc import Awaitable, Callable, Iterable
+from pathlib import Path
 from typing import TypeVar
 
 T = TypeVar("T")
@@ -138,6 +139,25 @@ def split_text(text: str, limit: int = TG_TEXT_LIMIT) -> list[str]:
 _WS_RE = re.compile(r"[ \t\u00a0]+")
 
 
+def normalize_phone(raw: str) -> str:
+    """Приводит пользовательский ввод к формату +7XXXXXXXXXX (для MAX/РФ).
+
+    Российская конвенция: ведущая 8 (междугородний код) эквивалентна +7 —
+    «8 999 123-45-67» -> «+79991234567». Номера других стран (+998…, +374…)
+    проходят как есть, если это 11 цифр с ведущей не-7/8.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 11 and digits[0] == "7":
+        return "+" + digits
+    if len(digits) == 11 and digits[0] == "8":
+        return "+7" + digits[1:]
+    if len(digits) == 10:
+        return "+7" + digits
+    if len(digits) == 11:  # другие страны: Казахстан +7, Узбекистан +998 и т.п.
+        return "+" + digits
+    raise ValueError(f"Не понимаю номер {raw!r} — отправьте +7 и 10 цифр")
+
+
 def normalize_ws(text: str) -> str:
     """Схлопывает непереносимые пробелы/табы, сохраняет переносы строк."""
     text = _WS_RE.sub(" ", text)
@@ -158,3 +178,37 @@ def truncate(text: str, size: int) -> str:
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+# ---------------------------------------------------------------------------
+# Ресурсы контейнера (для /admin «Системный статус»)
+# ---------------------------------------------------------------------------
+
+def read_ram_mb() -> tuple[int | None, int | None]:
+    """(используется, лимит) в МБ. Сначала cgroup v2 (весь контейнер),
+    затем v1, затем VmRSS своего процесса. (x, None) — лимит неизвестен."""
+    # cgroup v2 (docker default cgroup v2 на новых ядрах Orange Pi OS)
+    try:
+        cur = int(Path("/sys/fs/cgroup/memory.current").read_text().strip())
+        limit_raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        limit = None if limit_raw == "max" else int(limit_raw)
+        return cur // (1024 * 1024), (limit // (1024 * 1024) if limit else None)
+    except (OSError, ValueError):
+        pass
+    # cgroup v1
+    try:
+        cur = int(Path("/sys/fs/cgroup/memory/memory.usage_in_bytes").read_text().strip())
+        limit = int(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes").read_text().strip())
+        if limit > 1 << 48:
+            limit = 0
+        return cur // (1024 * 1024), (limit // (1024 * 1024) if limit else None)
+    except (OSError, ValueError):
+        pass
+    # последний рубеж — RSS собственного процесса
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) // 1024, None
+    except (OSError, ValueError, IndexError):
+        pass
+    return None, None

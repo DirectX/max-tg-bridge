@@ -18,8 +18,8 @@
 FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 
 #--- Мета -------------------------------------------------------------------
-LABEL org.opencontainers.image.title="max-telegram-bridge" \
-      org.opencontainers.image.description="24/7 мост web.max.ru <-> Telegram (Playwright + aiogram)" \
+LABEL org.opencontainers.image.title="max-telegram-bridge-v2" \
+      org.opencontainers.image.description="24/7 Multi-Account мост web.max.ru <-> Telegram (Playwright + aiogram)" \
       org.opencontainers.image.architecture="arm64"
 
 ENV PYTHONUNBUFFERED=1 \
@@ -44,16 +44,17 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY scripts ./scripts
 COPY scripts/xvfb-start.sh /usr/local/bin/xvfb-start.sh
-RUN chmod +x /usr/local/bin/xvfb-start.sh
+RUN chmod +x /usr/local/bin/xvfb-start.sh ./scripts/*.sh
 
 #--- Каталог данных ----------------------------------------------------------
 # /data монтируется томом из docker-compose:
-#   /data/chrome_profile  — persistent context (cookies, IndexedDB MAX)
-#   /data/state           — sqlite (дедупликация, маппинги TG->MAX)
+#   /data/profiles        — изолированные профили: account_1/, account_2/, .trash/
+#   /data/state           — sqlite v2 (роли, аккаунты, дедуп, маппинги)
 #   /data/tmp             — временные файлы картинок из Telegram
-#   /data/logs            — browser.log, скриншоты auth
-RUN mkdir -p /data/chrome_profile /data/state /data/tmp /data/logs
+#   /data/logs            — browser_a<N>.log, скриншоты auth_a<N>_*.png
+RUN mkdir -p /data/profiles /data/state /data/tmp /data/logs
 
 #--- Безопасность ------------------------------------------------------------
 # Официальный образ playwright работает под root; нам это безразлично
@@ -68,8 +69,9 @@ RUN mkdir -p /data/chrome_profile /data/state /data/tmp /data/logs
 
 # Проверка живости: процесс python должен жить, а профиль — не быть пустым.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=5 \
-    CMD python -c "import pathlib,sys; sys.exit(0 if (pathlib.Path('/data/state').exists() and pathlib.Path('/data/chrome_profile').exists()) else 1)" || exit 1
+    CMD python -c "import pathlib,sys; sys.exit(0 if (pathlib.Path('/data/state').exists() and pathlib.Path('/data/profiles').exists()) else 1)" || exit 1
 
-# Основной режим. Первичная авторизация — ПЕРЕЗАПИШИТЕ команду:
-#   docker compose run --rm bridge python -m app.auth
+# Основной режим. Авторизация аккаунтов — из Telegram (/admin → Добавить).
+# Аварийный консольный вход:
+#   docker compose run --rm bridge python -m app.auth --list
 CMD ["python", "-m", "app.main"]
