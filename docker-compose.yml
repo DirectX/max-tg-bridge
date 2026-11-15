@@ -1,0 +1,96 @@
+# ============================================================================
+#  MAX ⇄ Telegram bridge — Orange Pi 5 Plus (RK3588, 32GB, linux/arm64)
+# ============================================================================
+#  Запуск:
+#     docker compose up -d --build           # основной режим
+#     docker compose run --rm bridge python -m app.auth     # первичный вход
+#     docker compose logs -f bridge          # жизнь моста
+# ============================================================================
+
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: max-tg-bridge:latest
+    # Явно фиксируем архитектуру: даже если однажды соберёте/стянете amd64-образ,
+    # докер не поднимет эмуляцию qemu вместо нативного arm64.
+    platform: linux/arm64
+    container_name: max-tg-bridge
+
+    # Секреты и адресные данные — только из .env (см. .env.example)
+    env_file:
+      - .env
+    environment:
+      # Внутренние пути контейнера (наружу смонтированы в ./data):
+      PROFILE_DIR: /data/chrome_profile
+      TMP_DIR: /data/tmp
+      DB_PATH: /data/state/bridge.db
+      BROWSER_LOG: /data/logs/browser.log
+      TZ: Europe/Moscow            # от него же считает DAILY_RELOAD_HOUR
+
+    # ============ Специфика Chromium в docker на ARM64 ============
+    # shm_size: Chromium делит память между процессами через /dev/shm.
+    # Дефолтных 64 МБ не хватает — вкладки падают с "SIGBUS"/"out of memory".
+    # 2GB с запасом покрывает SPA-мессенджер с картинками.
+    shm_size: '2gb'
+    ipc: private
+
+    # MAX-трафик идёт НАПРЯМУЮ с резидентного домашнего IP (никаких прокси —
+    # иначе антифрод MAX увидит дата-центровый IP и аккаунт улетит в бан).
+    # Прокси (TG_API_BASE) касается ТОЛЬКО Telegram-части и на сеть контейнера
+    # не влияет вообще. Поэтому никакой special-сети тут не нужно — обычный
+    # bridge-драйвер, наружу интерфейс с домашним IP.
+    networks:
+      - bridge-net
+
+    volumes:
+      # Persistent-профиль Chromium: сессия MAX переживает рестарты/ребилды.
+      - ./data/chrome_profile:/data/chrome_profile
+      # SQLite-состояние моста (дедупликация сообщений, TG->MAX маппинг).
+      - ./data/state:/data/state
+      # Временные файлы (загрузка фото TG -> MAX).
+      - ./data/tmp:/data/tmp
+      # Логи и скриншоты (browser.log, auth_*.png).
+      - ./data/logs:/data/logs
+      # Если раскомментируете пользователя bridge в Dockerfile — убедитесь,
+      # что владелец каталогов ./data uid=1000:
+      #   sudo chown -R 1000:1000 ./data
+
+    # ============ Стабильность 24/7 ============
+    # Любая фатальная ошибка уронит контейнер — через 30 c поднимется заново
+    # с уже сохранённой сессией MAX в профиле.
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+    # Страховка от разрастания логов: json-лог максимум 3 файла по 8 МБ.
+    logging:
+      driver: json-file
+      options:
+        max-size: "8m"
+        max-file: "3"
+
+    deploy:
+      resources:
+        limits:
+          # Chromium с одной вкладкой web.max.ru + python-мост:
+          memory: 2500M
+          # RK3588 имеет 8 ядер; мосту хватает 2.5, остальное — системе.
+          cpus: "2.5"
+
+    # Для режима MAX_HEADLESS=false (видимый браузер в Xvfb / noVNC-отладка)
+    # раскомментируйте блок ниже и поставите в .env MAX_HEADLESS=false:
+    #
+    # entrypoint: ["/usr/local/bin/xvfb-start.sh"]
+    # environment-блок ниже дополните:
+    #   DISPLAY: ":99"
+
+networks:
+  bridge-net:
+    driver: bridge
+    name: max-tg-bridge-net
+
+# ============================================================================
+# РАСПАРОЛКА ДЛЯ Xvfb/noVNC (капча, ручная отладка). Файл xvfb-start.sh
+# лежит в образе (scripts/xvfb-start.sh): запускает Xvfb :99 и исполняет CMD.
+# ============================================================================

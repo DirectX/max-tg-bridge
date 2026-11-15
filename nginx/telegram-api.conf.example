@@ -1,0 +1,103 @@
+# ============================================================================
+#  Реверс-прокси Telegram Bot API для заблокированного api.telegram.org
+#  (вариант «HTTPS-фронт» — то, что ожидает TG_API_BASE в этом проекте)
+# ============================================================================
+#  Как это работает:
+#    aiogram -> https://tg-proxy.example.com/bot<token>/<method>
+#    Nginx   -> https://api.telegram.org/bot<token>/<method>  ( Host подменён )
+#
+#  ТРЕБОВАНИЯ:
+#   1. Домен с валидным TLS (certbot / другой ACME). Самоподписанный сертификат
+#      не примется без донастройки CA в контейнере.
+#   2. Nginx >= 1.19 (http/3 не обязателен).
+#   3. В конфиге моста НЕ используется download_file_by_url — только get_file +
+#      download_file, поэтому проксируем и путь /file/.
+#
+#  Альтернатива без своего домена: пробросать api.telegram.org на 443
+#  собственного VPS с нормальным TLS-сертификатом — конфиг идентичен.
+# ============================================================================
+
+# Кэш DNS api.telegram.org, чтобы не резолвить каждый запрос через отравленный
+# резолвер и ускорить соединение.
+resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
+resolver_timeout 5s;
+
+upstream tg_api_backend {
+    # ВАЖНО: server без keepalive к https без SNI-трюков; keepalive к одному
+    # IP здесь не привязываем, т.к. IP api.telegram.org плавающие.
+    server api.telegram.org:443;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+
+    server_name tg-proxy.example.com;      # <<< ваш домен
+
+    ssl_certificate     /etc/letsencrypt/live/tg-proxy.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/tg-proxy.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Bot API ответы небольшие, но фото до 10 МБ туда-сюда летают:
+    client_max_body_size 25m;
+
+    # --- основной API: /bot<token>/getMe, /bot<token>/sendMessage, ... --------
+    location /bot {
+        # Динамический upstream через переменную обходит кэш «bad gateway»
+        # при смене IP Telegram и не даёт nginx закэшировать мёртвый IP.
+        set $tg_backend "https://api.telegram.org";
+        proxy_pass $tg_backend;
+
+        proxy_ssl_server_name on;
+        proxy_ssl_name        api.telegram.org;
+        proxy_ssl_protocols   TLSv1.2 TLSv1.3;
+        # Если ваш резолвер отравлен и подмешивает неверный SNI-хост — включите
+        # проверку источника:  proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_ssl_verify      off;          # на проде лучше on + свой CA-блок
+
+        proxy_set_header Host api.telegram.org;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_connect_timeout 15s;
+        proxy_send_timeout    90s;
+        proxy_read_timeout    90s;          # long polling Bot API НЕ используем
+    }
+
+    # --- файлы: /file/bot<token>/<path> ----------------------------------------
+    location /file {
+        set $tg_backend_files "https://api.telegram.org";
+        proxy_pass $tg_backend_files;
+
+        proxy_ssl_server_name on;
+        proxy_ssl_name        api.telegram.org;
+        proxy_ssl_protocols   TLSv1.2 TLSv1.3;
+        proxy_ssl_verify      off;
+
+        proxy_set_header Host api.telegram.org;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        proxy_buffering on;                 # качаем фото целиком
+        proxy_connect_timeout 15s;
+        proxy_send_timeout    120s;
+        proxy_read_timeout    120s;
+    }
+
+    # Больше сюда ничего не проксируем.
+    location / {
+        return 403;
+    }
+
+    access_log /var/log/nginx/tg-proxy.access.log;
+    error_log  /var/log/nginx/tg-proxy.error.log warn;
+}
+
+# HTTP -> HTTPS
+server {
+    listen 80;
+    listen [::]:80;
+    server_name tg-proxy.example.com;
+    return 301 https://$host$request_uri;
+}

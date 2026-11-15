@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+data/
+chrome_profile/
+__pycache__/
+*.pyc
+.venv/
+venv/
+README.md
+nginx/
+
+.test_js_bridge.js
+tests/
