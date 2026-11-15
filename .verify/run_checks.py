@@ -12,7 +12,9 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import time
 import sys
+import threading
 import traceback
 from pathlib import Path
 
@@ -121,7 +123,7 @@ def c_migration():
     db = WORK / "state" / "v1.db"
     _make_v1_db(db)
     st = Store(db)
-    assert st._version() == 2
+    assert st._version() == 3                      # канон единый: v1->v3 одним прогоном
     acc = st.list_accounts()[0]
     assert acc.name.startswith("(миграция v1") and acc.status == "stopped"
     assert st.mark_seen(acc.id, "h1") is False          # перенесённый seen живёт
@@ -132,7 +134,7 @@ def c_migration():
     assert st.get_meta("migrated_from_v1")
     st.close()
     st2 = Store(db)                                      # идемпотентность
-    assert st2._version() == 2 and len(st2.list_accounts()) == 1
+    assert st2._version() == 3 and len(st2.list_accounts()) == 1
     st2.close()
 
 
@@ -368,12 +370,166 @@ def c_selectors():
         assert hasattr(S, key), key
 
 
+# ============================================================ v2.1 invites
+@check("миграция v2→v3: invites + listeners.username/full_name без потери данных")
+def c_mig_v2_to_v3():
+    from app.store import Store
+    db = WORK / "state" / "v2.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(db)
+    # воспроизводим канон v2 (без invites, listeners без username/full_name)
+    c.executescript("""
+      CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+        phone TEXT DEFAULT '', max_chat_title TEXT NOT NULL DEFAULT '',
+        max_chat_url TEXT NOT NULL DEFAULT '', max_self_name TEXT NOT NULL DEFAULT '',
+        owner_tg_id INTEGER, status TEXT NOT NULL DEFAULT 'stopped',
+        profile_path TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL);
+      CREATE TABLE listeners (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        tg_user_id INTEGER NOT NULL, alias TEXT DEFAULT '', created_at INTEGER NOT NULL,
+        UNIQUE (account_id, tg_user_id));
+      CREATE TABLE message_map (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        tg_user_id INTEGER NOT NULL, tg_message_id INTEGER NOT NULL UNIQUE,
+        max_message_key TEXT DEFAULT '', max_sender TEXT DEFAULT '',
+        max_preview TEXT DEFAULT '', created_at INTEGER NOT NULL);
+      CREATE TABLE seen_message (account_id INTEGER NOT NULL, key TEXT NOT NULL,
+        first_seen INTEGER NOT NULL, PRIMARY KEY (account_id, key));
+      CREATE TABLE stats (account_id INTEGER NOT NULL, name TEXT NOT NULL,
+        value INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (account_id, name));
+      CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT);
+      PRAGMA user_version = 2;
+    """)
+    c.execute("INSERT INTO accounts (name,max_chat_title,owner_tg_id,status,created_at,updated_at)"
+              " VALUES ('Школа 5Б','9 Б',100,'active',1,1)")
+    aid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    c.execute("INSERT INTO listeners (account_id,tg_user_id,alias,created_at) VALUES (?,101,'Папа Маши',1)", (aid,))
+    c.execute("INSERT INTO seen_message VALUES (?, 'h1', ?)", (aid, int(time.time())))
+    c.commit(); c.close()
+
+    st = Store(db)
+    assert st._version() == 3, st._version()
+    # данные v2 целы
+    acc = st.get_account(aid)
+    assert acc.name == "Школа 5Б" and acc.status == "active"
+    assert st.mark_seen(aid, "h1") is False
+    rows = st.list_listeners(aid)
+    assert rows[0]["tg_user_id"] == 101 and rows[0]["alias"] == "Папа Маши"
+    assert rows[0]["username"] is None and rows[0]["full_name"] is None  # v2-совместимость
+    # invites появились и работают
+    r = st.create_invite(aid, "listener", max_uses=5)
+    assert st.get_invite(r["token"]) is not None
+    st.close()
+    st2 = Store(db)  # идемпотентность повторного открытия
+    assert st2._version() == 3 and len(st2.list_listeners(aid)) == 1
+    st2.close()
+
+
+@check("invites: CRUD, owner-force-once, лимиты, срок, отзыв, каскад")
+def c_invites_crud():
+    from app.store import Store
+    st = Store(WORK / "state" / "inv.db")
+    acc = st.create_account("5Б", chat_title="9 Б", owner_tg_id=100)
+    # listener-инвайт на 2 активации
+    inv = st.create_invite(acc.id, "listener", max_uses=2)
+    assert inv["role"] == "listener" and inv["max_uses"] == 2 and inv["used_count"] == 0
+    s1, _, _ = st.redeem_invite(inv["token"], 201, "Анна Смирнова", "anna_s")
+    assert s1 == "ok_listener"
+    l = [r for r in st.list_listeners(acc.id) if r["tg_user_id"] == 201][0]
+    assert l["full_name"] == "Анна Смирнова" and l["username"] == "anna_s"
+    s2, _, _ = st.redeem_invite(inv["token"], 202, "Пётр", None)
+    assert s2 == "ok_listener"
+    s3, row3, _ = st.redeem_invite(inv["token"], 203, "Вася", None)
+    assert s3 == "exhausted" and row3["used_count"] == 2
+    assert st.redeem_invite("нет-такого", 1, "x", None)[0] == "invalid"
+    # срок действия
+    inv_exp = st.create_invite(acc.id, "listener", max_uses=1, ttl_seconds=-1)
+    st.redeem_invite(inv_exp["token"], 9, "x", None)  # просрочен: increment не прошёл
+    s, _, _ = st.redeem_invite(inv_exp["token"], 9, "x", None)
+    assert s == "expired", s
+    # безлимит
+    inv_u = st.create_invite(acc.id, "listener", max_uses=0)
+    for i in range(5):
+        assert st.redeem_invite(inv_u["token"], 300 + i, f"U{i}", None)[0] == "ok_listener"
+    assert st.get_invite(inv_u["token"])["used_count"] == 5
+    # owner: force once, и повтор — exhausted
+    inv_o = st.create_invite(acc.id, "owner", max_uses=99)  # 99 игнорируется
+    assert inv_o["max_uses"] == 1
+    assert st.redeem_invite(inv_o["token"], 500, "Новый Владелец", "nv")[0] == "ok_owner"
+    assert st.get_account(acc.id).owner_tg_id == 500
+    assert st.redeem_invite(inv_o["token"], 501, "Второй", None)[0] == "exhausted"
+    assert st.get_account(acc.id).owner_tg_id == 500  # не перебил
+    # отзыв
+    inv_r = st.create_invite(acc.id, "listener", max_uses=1)
+    assert st.revoke_invite(inv_r["id"]) is True
+    assert st.redeem_invite(inv_r["token"], 600, "x", None)[0] == "invalid"
+    # active_only hides exhausted
+    actives = st.list_invites(acc.id, active_only=True)
+    tokens = {r["token"] for r in actives}
+    assert inv_u["token"] in tokens and inv["token"] not in tokens
+    # каскад: удаление аккаунта стирает инвайты
+    acc2 = st.create_account("Робо", chat_title="К")
+    st.create_invite(acc2.id, "listener")
+    st.delete_account(acc2.id)
+    assert st.list_invites(acc2.id, active_only=False) == []
+    # инвайт на удалённый аккаунт — честная ошибка, а не «коллизия токена»
+    try:
+        st.create_invite(acc2.id, "listener")
+        raise AssertionError("FK не сработал")
+    except ValueError as e:
+        assert "не существует" in str(e), e
+    st.close()
+
+
+@check("invites: гонка двух потоков по одноразовой ссылке — ровно один успех")
+def c_invite_race():
+    from app.store import Store
+    db = WORK / "state" / "race.db"
+    st = Store(db)
+    acc = st.create_account("Гонка", chat_title="G", owner_tg_id=1)
+    inv = st.create_invite(acc.id, "listener", max_uses=1)
+    token = inv["token"]
+    st.close()  # соединения разные: реальная межпроцессная блокировка
+
+    results = []
+    def racer(uid):
+        s = Store(db)
+        try:
+            results.append(s.redeem_invite(token, uid, f"U{uid}", None)[0])
+        finally:
+            s.close()
+
+    threads = [threading.Thread(target=racer, args=(1000 + i,)) for i in range(6)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    ok = [r for r in results if r == "ok_listener"]
+    assert len(ok) == 1, results
+    s = Store(db)
+    assert s.get_invite(token)["used_count"] == 1
+    assert len(s.list_listeners(acc.id)) == 1
+    s.close()
+
+
+@check("invite_link: сборка deep-link из username бота (и None без username)")
+def c_invite_link():
+    import depstub
+    from app.config import load_config
+    from app.tg.bot import TelegramCore
+    cfg = load_config()
+    core = TelegramCore(cfg)
+    assert core.invite_link("abc") is None          # до prepare() username нет
+    core.bot_username = "my_school_bridge"
+    assert core.invite_link("abc") == \
+        "https://t.me/my_school_bridge?start=inv_abc"
+
 def main() -> int:
     shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(parents=True)
     print("Проверки v2 (офлайн):\n")
     for fn in (c_compile, c_imports, c_routers, c_migration, c_roles, c_migrate_script,
-               c_fanout, c_manager, c_utils, c_js, c_compose, c_selectors):
+               c_fanout, c_manager, c_utils, c_js, c_compose, c_selectors,
+               c_mig_v2_to_v3, c_invites_crud, c_invite_race, c_invite_link):
         fn()
     ok = sum(1 for _, s, _ in RESULTS if s)
     failed = [(n, e) for n, s, e in RESULTS if not s]

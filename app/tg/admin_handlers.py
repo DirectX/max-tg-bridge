@@ -21,6 +21,7 @@ app/tg/admin_handlers.py
 from __future__ import annotations
 
 import asyncio
+import time
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -35,12 +36,23 @@ from .bot import TelegramCore
 from .keyboards import (
     account_actions,
     delete_confirm,
+    invite_options_picker,
+    invite_role_picker,
+    invites_panel,
     listeners_panel,
     main_menu,
 )
 from .states import AdminInput
 
 log = get_logger("tg.admin")
+
+# opt -> (max_uses, ttl_seconds): 0 = безлимит, None = бессрочно
+_INVITE_OPTS: dict[str, tuple[int, int | None]] = {
+    "once":  (1, None),
+    "five":  (5, None),
+    "unlim": (0, None),
+    "day":   (1, 24 * 3600),
+}
 
 STATUS_LINE = {
     "active": "🟢 работает",
@@ -68,7 +80,9 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             await callback.message.answer(text, reply_markup=kb)
 
     # ================================================================ /admin
-    @router.message(Command("admin"), Command("status"))
+    # OR-логика: aiogram объединяет позиционные фильтры через AND, поэтому
+    # «/admin» и «/status» — один фильтр-or (иначе /status не матчился бы никогда)
+    @router.message(Command("admin") | Command("status"))
     async def cmd_admin(message: Message) -> None:
         if not _admin(message=message):
             await message.answer("⛔ Доступ только для супер-администратора.")
@@ -230,6 +244,30 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
                                  "(он не запускал бота).")
 
     # -------------------------------------------------------------- слушатели
+    def _listener_pairs(account_id: int) -> list[tuple[int, str]]:
+        """[(tg_user_id, «Имя Ф. (@user)»)] — человекочитаемо, с фолбэком на alias/id."""
+        pairs: list[tuple[int, str]] = []
+        for r in store.list_listeners(account_id):
+            uid = r["tg_user_id"]
+            name = r["full_name"] or r["alias"] or ""
+            uname = f" (@{r['username']})" if r["username"] else ""
+            label = f"👤 {name}{uname}".strip() if name else f"👤 id {uid}"
+            pairs.append((uid, label))
+        return pairs
+
+    def _listener_listing(account_id: int) -> str:
+        rows = store.list_listeners(account_id)
+        if not rows:
+            return "  (пока никого)"
+        lines = []
+        for r in rows:
+            uid = r["tg_user_id"]
+            name = r["full_name"] or r["alias"]
+            uname = f" (@{r['username']})" if r["username"] else ""
+            who = f"{name}{uname}" if name else "имя неизвестно"
+            lines.append(f"  • {who} [{hcode(str(uid))}]")
+        return "\n".join(lines)
+
     @router.callback_query(F.data.startswith("lis:"))
     async def cb_lis(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer()
@@ -240,14 +278,12 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         acc = store.get_account(account_id)
         if acc is None:
             return
-        rows = store.list_listeners(account_id)
-        ids = [r["tg_user_id"] for r in rows]
-        listing = "\n".join(
-            f"  • {hcode(str(r['tg_user_id']))} {r['alias'] or ''}" for r in rows
-        ) or "  (пока никого)"
-        text = (f"👥 Слушатели «{hbold(acc.name)}» (только чтение):\n{listing}\n\n"
-                "Слушатели получают копию всех входящих из MAX, но отвечать не могут.")
-        await _edit_or_send(callback, text, listeners_panel(account_id, ids))
+        text = (f"👥 Слушатели «{hbold(acc.name)}» (только чтение):\n"
+                f"{_listener_listing(account_id)}\n\n"
+                "Слушатели получают копию всех входящих из MAX, но отвечать не могут.\n"
+                "Быстрее подключать людей — инвайт-ссылкой (🔗 в меню аккаунта).")
+        await _edit_or_send(callback, text,
+                            listeners_panel(account_id, _listener_pairs(account_id)))
 
     @router.callback_query(F.data.startswith("lisadd:"))
     async def cb_lisadd(callback: CallbackQuery, state: FSMContext) -> None:
@@ -309,19 +345,134 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         if not _admin(callback=callback):
             return
         _, account_id, uid = callback.data.split(":")
-        removed = store.remove_listener(int(account_id), int(uid))
-        acc = store.get_account(int(account_id))
-        rows = store.list_listeners(int(account_id))
-        ids = [r["tg_user_id"] for r in rows]
-        listing = "\n".join(
-            f"  • {hcode(str(r['tg_user_id']))} {r['alias'] or ''}" for r in rows
-        ) or "  (пока никого)"
+        account_id, uid = int(account_id), int(uid)
+        removed = store.remove_listener(account_id, uid)
+        acc = store.get_account(account_id)
         if acc:
+            if removed:
+                # вежливо сообщаем отключённому (требование 1.3, опционально)
+                try:
+                    await tg.bot.send_message(
+                        uid,
+                        f"ℹ️ Вы отключены от аккаунта MAX «{acc.name}». "
+                        "Сообщения из этого чата больше приходить не будут.")
+                except Exception:  # noqa: BLE001
+                    log.debug("Уведомление об отключении не ушло пользователю %s", uid)
             await _edit_or_send(
                 callback,
-                ("✅ Удалён.\n\n" if removed else "Не найдён.\n\n")
-                + f"👥 Слушатели «{hbold(acc.name)}»:\n{listing}",
-                listeners_panel(acc.id, ids))
+                ("✅ Слушатель отключён.\n\n" if removed else "Не найдён.\n\n")
+                + f"👥 Слушатели «{hbold(acc.name)}»:\n{_listener_listing(account_id)}",
+                listeners_panel(account_id, _listener_pairs(account_id)))
+
+    # ================================================== v2.1 инвайт-ссылки
+    @router.callback_query(F.data.startswith("invnew:"))
+    async def cb_invnew(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        if not _admin(callback=callback):
+            return
+        await state.clear()
+        account_id = int(callback.data.split(":")[1])
+        if store.get_account(account_id) is None:
+            return
+        await _edit_or_send(
+            callback,
+            "🔗 Для кого создаём ссылку?\n"
+            "• Слушатель — только чтение (можно одноразово / на 5 / безлимит / 24 ч);\n"
+            "• Владелец — строго одноразовая: привязка основного пользователя аккаунта.",
+            invite_role_picker(account_id))
+
+    @router.callback_query(F.data.startswith("invrole:"))
+    async def cb_invrole(callback: CallbackQuery) -> None:
+        await callback.answer()
+        if not _admin(callback=callback):
+            return
+        _, account_id, role = callback.data.split(":")
+        await _edit_or_send(
+            callback,
+            "Какие параметры у ссылки?",
+            invite_options_picker(int(account_id), role))
+
+    @router.callback_query(F.data.startswith("invopt:"))
+    async def cb_invopt(callback: CallbackQuery) -> None:
+        await callback.answer()
+        if not _admin(callback=callback):
+            return
+        _, account_id, role, opt = callback.data.split(":")
+        account_id, role = int(account_id), role
+        pair = _INVITE_OPTS.get(opt)
+        if pair is None:
+            await callback.message.answer("⚠️ Неизвестный параметр ссылки.")
+            return
+        max_uses, ttl = pair
+        acc = store.get_account(account_id)
+        if acc is None:
+            return
+        row = store.create_invite(account_id, role, max_uses=max_uses, ttl_seconds=ttl)
+        link = tg.invite_link(row["token"])
+        role_ru = "Владелец" if role == "owner" else "Слушатель"
+        limit_ru = ("безлимит" if max_uses == 0
+                    else f"{max_uses} активаций")
+        exp_ru = (time.strftime("%d.%m %H:%M", time.localtime(row["expires_at"]))
+                  if row["expires_at"] else "бессрочно")
+        if link:
+            await callback.message.answer(
+                f"🔗 Ссылка готова (роль: {role_ru}, {limit_ru}, действует до "
+                f"{exp_ru}):\n\n<code>{link}</code>\n\n"
+                "Перешлите её человеку в Telegram. Он откроет чат с ботом и нажмёт "
+                "«Запустить» — привязка произойдёт автоматически, его id искать не нужно.",
+                parse_mode="HTML")
+        else:
+            # у бота нет username — остаётся ручной путь /start inv_<token>
+            await callback.message.answer(
+                f"🔗 Ссылку собрать не удалось: у бота нет @username.\n"
+                f"Токен: <code>{row['token']}</code> — человек может ввести "
+                f"/start inv_{row['token']} вручную.", parse_mode="HTML")
+
+    @router.callback_query(F.data.startswith("invlist:"))
+    async def cb_invlist(callback: CallbackQuery) -> None:
+        await callback.answer()
+        if not _admin(callback=callback):
+            return
+        account_id = int(callback.data.split(":")[1])
+        acc = store.get_account(account_id)
+        if acc is None:
+            return
+        rows = store.list_invites(account_id)
+        pairs = []
+        for r in rows:
+            left = "∞" if r["max_uses"] == 0 else max(r["max_uses"] - r["used_count"], 0)
+            tot = "∞" if r["max_uses"] == 0 else r["max_uses"]
+            exp = (time.strftime("%d.%m %H:%M", time.localtime(r["expires_at"]))
+                   if r["expires_at"] else "бессрочно")
+            role = "👑" if r["role"] == "owner" else "👀"
+            pairs.append((r["id"], f"{role} осталось {left}/{tot} · до {exp}"))
+        text = (f"🎟 Действующие инвайты «{hbold(acc.name)}»:\n"
+                + ("\n".join(f"  • {p[1]} (id {p[0]})" for p in pairs)
+                   or "  (нет активных — создайте через «🔗 Создать инвайт-ссылку»)"))
+        await _edit_or_send(callback, text, invites_panel(account_id, pairs))
+
+    @router.callback_query(F.data.startswith("invrev:"))
+    async def cb_invrev(callback: CallbackQuery) -> None:
+        await callback.answer()
+        if not _admin(callback=callback):
+            return
+        _, account_id, invite_id = callback.data.split(":")
+        revoked = store.revoke_invite(int(invite_id))
+        rows = store.list_invites(int(account_id))
+        pairs = []
+        for r in rows:
+            left = "∞" if r["max_uses"] == 0 else max(r["max_uses"] - r["used_count"], 0)
+            tot = "∞" if r["max_uses"] == 0 else r["max_uses"]
+            exp = (time.strftime("%d.%m %H:%M", time.localtime(r["expires_at"]))
+                   if r["expires_at"] else "бессрочно")
+            role = "👑" if r["role"] == "owner" else "👀"
+            pairs.append((r["id"], f"{role} осталось {left}/{tot} · до {exp}"))
+        await _edit_or_send(
+            callback,
+            ("🚫 Инвайт отозван.\n\n" if revoked else "Инвайт уже удалён.\n\n")
+            + "🎟 Действующие инвайты:\n"
+            + ("\n".join(f"  • {p[1]} (id {p[0]})" for p in pairs) or "  (пусто)"),
+            invites_panel(int(account_id), pairs))
 
     @router.message(Command("help"))
     async def cmd_help(message: Message) -> None:

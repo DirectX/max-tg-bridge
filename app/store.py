@@ -1,16 +1,17 @@
 """
-app/store.py  (v2)
-==================
+app/store.py  (v2.1)
+====================
 Хранилище ролевой модели и состояния моста. SQLite, стандартный sqlite3.
 Схема версионируется через PRAGMA user_version; миграции — функции вида
-``_mig_<n>``. Текущая версия: 2.
+``_migrate_vN_to_vM``. Текущая версия: 3.
 
 Версии:
   0 -> 1 : первичная v1-схема (seen_message/msg_map/meta) — историческая
   1 -> 2 : v2 Multi-Account & Role-Based:
            accounts, listeners, message_map; seen_message с account_id.
-           Данные v1 (один общий мост) при наличии мигрируются в «аккаунт №1»
-           с seeding'ом из ENV (см. seed_v1).
+  2 -> 3 : v2.1 Инвайт-ссылки (deep linking):
+           новая таблица invites; у listeners добавлены username/full_name
+           (совместимо с ручным добавлением по ID из v2.0 — колонки NULL).
 
 Все записи — короткие транзакции в WAL; вызовы синхронные (микросекунды,
 отдельный пул потоков не нужен при 2-5 аккаунтах и школьных объёмах).
@@ -18,6 +19,8 @@ app/store.py  (v2)
 
 from __future__ import annotations
 
+import contextlib
+import secrets
 import sqlite3
 import threading
 import time
@@ -29,12 +32,12 @@ from .utils import get_logger
 
 log = get_logger("store")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # ---------------------------------------------------------------------------
-# Схема v2
+# Схема v3 (канон: CREATE TABLE IF NOT EXISTS — безопасна поверх v2)
 # ---------------------------------------------------------------------------
-_SCHEMA_V2 = """
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT    NOT NULL UNIQUE,           -- «Школа 5Б»
@@ -54,6 +57,8 @@ CREATE TABLE IF NOT EXISTS listeners (
     account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     tg_user_id  INTEGER NOT NULL,
     alias       TEXT    DEFAULT '',
+    username    TEXT,                                  -- v3: @username (nullable)
+    full_name   TEXT,                                  -- v3: имя (nullable)
     created_at  INTEGER NOT NULL,
     UNIQUE (account_id, tg_user_id)
 );
@@ -89,6 +94,21 @@ CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
     v TEXT
 );
+
+-- v2.1: инвайт-ссылки (deep linking) для саморегистрации.
+-- expires_at/max_uses/used_count — числа (epoch-секунды / счётчик),
+-- как и везде в этой схеме: никакого DATETIME-парсинга в рантайме.
+CREATE TABLE IF NOT EXISTS invites (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    token       TEXT    NOT NULL UNIQUE,
+    account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    role        TEXT    NOT NULL,                      -- 'listener' | 'owner'
+    max_uses    INTEGER NOT NULL DEFAULT 1,            -- 0 = безлимит
+    used_count  INTEGER NOT NULL DEFAULT 0,
+    expires_at  INTEGER,                               -- epoch или NULL = бессрочно
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_invites_account ON invites(account_id);
 """
 
 
@@ -160,20 +180,38 @@ class Store:
             ver = self._version()
             if ver == 0:
                 if self._table_exists("seen_message") and not self._table_exists("accounts"):
-                    log.info("Найдена v1-база — мигрируем в схему v2")
+                    log.info("Найдена v1-база — мигрируем в схему v%d", SCHEMA_VERSION)
                     self._migrate_v1_to_v2()
                 else:
-                    self._db.executescript(_SCHEMA_V2)
-                    log.info("Создана свежая v2-база")
+                    self._db.executescript(_SCHEMA)
+                    log.info("Создана свежая v%d-база", SCHEMA_VERSION)
                 self._set_version(SCHEMA_VERSION)
             elif 0 < ver < SCHEMA_VERSION:
-                self._db.executescript(_SCHEMA_V2)
+                # пошагово: v2 -> v3 (и т.д. в будущем)
+                if ver < 3:
+                    self._migrate_v2_to_v3()
                 self._set_version(SCHEMA_VERSION)
             # проверка целостности минимальная
-            missing = [t for t in ("accounts", "listeners", "message_map", "seen_message")
+            missing = [t for t in ("accounts", "listeners", "message_map",
+                                   "seen_message", "invites")
                        if not self._table_exists(t)]
             if missing:
                 raise RuntimeError(f"БД повреждена: отсутствуют таблицы {missing}")
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        rows = self._db.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r["name"] == column for r in rows)
+
+    def _migrate_v2_to_v3(self) -> None:
+        """v2.1: таблица invites + колонки listeners.username/full_name.
+        Данные v2.0 не трогаем: новые колонки nullable, старые строки = NULL."""
+        log.info("Миграция v2 -> v3: invites, listeners.username/full_name")
+        self._db.executescript(_SCHEMA)  # CREATE ... IF NOT EXISTS (включая invites)
+        for col in ("username", "full_name"):
+            if not self._column_exists("listeners", col):
+                self._db.execute(f"ALTER TABLE listeners ADD COLUMN {col} TEXT")
+                log.info("listeners: добавлена колонка %s", col)
+        self._db.commit()
 
     def _migrate_v1_to_v2(self) -> None:
         """v1: seen_message(key TEXT PK), msg_map(tg_message_id...), meta.
@@ -186,7 +224,7 @@ class Store:
         # CREATE TABLE IF NOT EXISTS её не починит: сносим после чтения данных.
         self._db.execute("DROP TABLE seen_message")
         self._db.execute("DROP TABLE msg_map")
-        self._db.executescript(_SCHEMA_V2)
+        self._db.executescript(_SCHEMA)
 
         # временный флаг: реальный посев (название/чат/владелец) придёт из ENV
         self._db.execute(
@@ -306,14 +344,34 @@ class Store:
         return [Account.from_row(r) for r in rows]
 
     # ============================================================ listeners
-    def add_listener(self, account_id: int, tg_user_id: int, alias: str = "") -> bool:
+    def _apply_listener(self, account_id: int, tg_user_id: int, alias: str,
+                        username: str | None, full_name: str | None) -> bool:
+        """UPSERT слушателя БЕЗ управления транзакцией (вызывающий держит её).
+        True — слушатель добавлен новым."""
+        was = self._db.execute(
+            "SELECT 1 FROM listeners WHERE account_id=? AND tg_user_id=?",
+            (account_id, tg_user_id),
+        ).fetchone() is not None
+        self._db.execute(
+            "INSERT INTO listeners (account_id, tg_user_id, alias, username,"
+            " full_name, created_at) VALUES (?,?,?,?,?,?)"
+            " ON CONFLICT(account_id, tg_user_id) DO UPDATE SET"
+            "   alias = COALESCE(NULLIF(excluded.alias,''), listeners.alias),"
+            "   username = COALESCE(excluded.username, listeners.username),"
+            "   full_name = COALESCE(excluded.full_name, listeners.full_name)",
+            (account_id, tg_user_id, alias, username, full_name, int(time.time())),
+        )
+        return not was
+
+    def add_listener(self, account_id: int, tg_user_id: int, alias: str = "",
+                     *, username: str | None = None, full_name: str | None = None) -> bool:
+        """Добавить слушателя (или обновить его имя/@username, если он уже есть).
+
+        Возвращает True, если слушатель ДОБАВЛЕН новым, False — если уже был.
+        Совместимо с v2.0: username/full_name опциональны (ручной ввод по ID).
+        """
         with self._lock, self._db:
-            cur = self._db.execute(
-                "INSERT OR IGNORE INTO listeners (account_id, tg_user_id, alias, created_at)"
-                " VALUES (?,?,?,?)",
-                (account_id, tg_user_id, alias, int(time.time())),
-            )
-            return cur.rowcount > 0
+            return self._apply_listener(account_id, tg_user_id, alias, username, full_name)
 
     def remove_listener(self, account_id: int, tg_user_id: int) -> bool:
         with self._lock, self._db:
@@ -418,6 +476,156 @@ class Store:
                 " ON CONFLICT(k) DO UPDATE SET v = excluded.v",
                 (key, value),
             )
+
+    # ================================================================ invites
+    @contextlib.contextmanager
+    def _immediate(self):
+        """Явная BEGIN IMMEDIATE-транзакция (блокирует запись на весь блок).
+        Безопасно сосуществует с ленивыми транзакциями sqlite3: если она уже
+        открыта — переиспользуем, не начинаем вложенную."""
+        with self._lock:
+            started = not self._db.in_transaction
+            if started:
+                # явный BEGIN IMMEDIATE: блокирует запись во всей БД на время
+                # блока — второй процесс/таска не проскочит с тем же токеном
+                self._db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                if started:
+                    self._db.commit()
+            except BaseException:
+                if started:
+                    self._db.rollback()
+                raise
+
+    def create_invite(self, account_id: int, role: str, *, max_uses: int = 1,
+                      ttl_seconds: int | None = None,
+                      token: str | None = None) -> sqlite3.Row:
+        """Создать инвайт. role: 'listener' | 'owner'.
+        max_uses=0 — безлимит; owner всегда строго одноразовый (force)."""
+        if role not in ("listener", "owner"):
+            raise ValueError(f"Недопустимая роль инвайта: {role!r}")
+        if role == "owner":
+            max_uses = 1  # привязка владельца — только один раз
+        token = token or secrets.token_urlsafe(16)
+        now = int(time.time())
+        expires_at = (now + ttl_seconds) if ttl_seconds else None
+        with self._immediate():
+            # на всякий случай переберём токен при (маловероятной) коллизии;
+            # нарушение FK (аккаунт удалён) — НЕ коллизия, пробрасываем честно
+            for attempt in range(5):
+                try:
+                    self._db.execute(
+                        "INSERT INTO invites (token, account_id, role, max_uses,"
+                        " used_count, expires_at, created_at) VALUES (?,?,?,?,?,?,?)",
+                        (token, account_id, role, max_uses, 0, expires_at, now),
+                    )
+                    break
+                except sqlite3.IntegrityError as exc:
+                    msg = str(exc).lower()
+                    if "unique" in msg and attempt < 4:
+                        token = secrets.token_urlsafe(16)
+                        continue
+                    if "foreign key" in msg:
+                        raise ValueError(
+                            f"Аккаунт #{account_id} не существует — инвайт не создан"
+                        ) from exc
+                    raise
+            else:  # pragma: no cover
+                raise RuntimeError("Не удалось сгенерировать уникальный токен инвайта")
+            row = self._db.execute(
+                "SELECT * FROM invites WHERE token=?", (token,)
+            ).fetchone()
+        return row
+
+    def list_invites(self, account_id: int, *, active_only: bool = True) -> list[sqlite3.Row]:
+        """Список инвайтов аккаунта. active_only — скрыть исчерпанные/просроченные."""
+        now = int(time.time())
+        sql = "SELECT * FROM invites WHERE account_id=?"
+        if active_only:
+            sql += (" AND (expires_at IS NULL OR expires_at > ?)"
+                    " AND (max_uses = 0 OR used_count < max_uses)")
+        sql += " ORDER BY id DESC"
+        with self._lock:
+            # порядок параметров = порядок «?» в запросе: account_id, затем now
+            params = (account_id, now) if active_only else (account_id,)
+            return self._db.execute(sql, params).fetchall()
+
+    def get_invite(self, token: str) -> sqlite3.Row | None:
+        with self._lock:
+            return self._db.execute(
+                "SELECT * FROM invites WHERE token=?", (token,)
+            ).fetchone()
+
+    def revoke_invite(self, invite_id: int) -> bool:
+        with self._lock, self._db:
+            cur = self._db.execute("DELETE FROM invites WHERE id=?", (invite_id,))
+            return cur.rowcount > 0
+
+    def redeem_invite(self, token: str, tg_user_id: int, full_name: str,
+                      username: str | None) -> tuple[str, sqlite3.Row | None, Account | None]:
+        """АТОМАРНО активировать инвайт и применить его.
+
+        Возвращает (status, invite_row, account):
+          'ok_listener' | 'ok_owner'  — успех (счётчик уже увеличен);
+          'invalid'  — токена нет;
+          'expired'  — истёк срок;
+          'exhausted'— исчерпан лимит (для owner — уже использован);
+          'no_account' — аккаунт инвайта удалён.
+
+        Гонка двух людей по одноразовой ссылке исключена: increment — это
+        guarded UPDATE ... WHERE (условия лимита в самой строке), выполняемый
+        внутри BEGIN IMMEDIATE. Второй пришедший увидит rowcount=0 и получит
+        'exhausted', даже если оба запроса стартовали одновременно.
+        """
+        now = int(time.time())
+        with self._immediate():
+            row = self._db.execute(
+                "SELECT * FROM invites WHERE token=?", (token,)
+            ).fetchone()
+            if row is None:
+                return "invalid", None, None
+            # Guarded increment: условия лимита — прямо в WHERE.
+            cur = self._db.execute(
+                "UPDATE invites SET used_count = used_count + 1"
+                " WHERE token = ?"
+                "   AND (expires_at IS NULL OR expires_at > ?)"
+                "   AND (max_uses = 0 OR used_count < max_uses)"
+                "   AND (role <> 'owner' OR used_count = 0)",
+                (token, now),
+            )
+            if cur.rowcount == 0:
+                fresh = self._db.execute(
+                    "SELECT * FROM invites WHERE token=?", (token,)
+                ).fetchone()
+                if fresh and fresh["expires_at"] is not None and fresh["expires_at"] <= now:
+                    return "expired", fresh, None
+                return "exhausted", fresh, None
+            invite = self._db.execute(
+                "SELECT * FROM invites WHERE token=?", (token,)
+            ).fetchone()
+            acc_row = self._db.execute(
+                "SELECT * FROM accounts WHERE id=?", (invite["account_id"],)
+            ).fetchone()
+            if acc_row is None:
+                # аккаунт удалён, а счётчик уже потрачен — откатываем increment
+                self._db.execute(
+                    "UPDATE invites SET used_count = used_count - 1 WHERE token=?",
+                    (token,),
+                )
+                return "no_account", invite, None
+            account = Account.from_row(acc_row)
+            if invite["role"] == "owner":
+                self._db.execute(
+                    "UPDATE accounts SET owner_tg_id=?, updated_at=? WHERE id=?",
+                    (tg_user_id, now, account.id),
+                )
+                status = "ok_owner"
+            else:
+                # _apply_listener (не add_listener): транзакцию держим нашу
+                self._apply_listener(account.id, tg_user_id, "", username, full_name)
+                status = "ok_listener"
+        return status, invite, account
 
     # ================================================================ house
     def _purge_old(self) -> None:

@@ -97,12 +97,24 @@ class TelegramCore:
         self.bot = Bot(cfg.tg_token, **kwargs)
         self.dp = Dispatcher(storage=MemoryStorage())
         self._ack_ts: dict[int, float] = {}
+        # заполняется в prepare(): нужен для сборки инвайт-deep-link ссылок
+        self.bot_username: str | None = None
+        self.bot_id: int | None = None
 
     # ------------------------------------------------------------- lifecycle
     async def prepare(self) -> None:
         me = await self.bot.get_me()
+        self.bot_username = me.username
+        self.bot_id = me.id
         log.info("Telegram: авторизовался @%s через %s (admin=%s)",
                  me.username, self.cfg.tg_api_base, self.cfg.admin_tg_id)
+
+    def invite_link(self, token: str) -> str | None:
+        """Deep-link «https://t.me/<bot>?start=inv_<token>» или None, если
+        у бота нет username (тогда ссылку не собрать — только /start inv_...)."""
+        if not self.bot_username:
+            return None
+        return f"https://t.me/{self.bot_username}?start=inv_{token}"
 
     async def run_polling(self) -> None:
         await self.bot.delete_webhook(drop_pending_updates=True)

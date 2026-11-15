@@ -34,9 +34,86 @@ from .states import UserFlow
 
 log = get_logger("tg.user")
 
+INVALID_LINK_TEXT = ("Ссылка недействительна или срок её действия истёк. "
+                     "Запросите новую у администратора")
+EXPIRED_LINK_TEXT = INVALID_LINK_TEXT
+
+
+def _who(user) -> str:
+    name = user.full_name or "Без имени"
+    uname = f" (@{user.username})" if user.username else ""
+    return f"{name}{uname}, ID: {user.id}"
+
+
+async def _notify_admin_invite(tg, cfg, invite, account, user, status: str) -> None:
+    """Пуш админу о подключении по инвайту (требование 1.2)."""
+    role = "Владельцем" if status == "ok_owner" else "Слушателем"
+    await tg.notify_admin(
+        f"✅ Пользователь {_who(user)} подключился по инвайт-ссылке как {role} "
+        f"к аккаунту «{account.name}».\n"
+        f"Остаток активаций ссылки: "
+        f"{'∞' if invite['max_uses'] == 0 else max(invite['max_uses'] - invite['used_count'], 0)}."
+    )
+
 
 def register(router: Router, cfg, store, tg, mgr) -> None:
     label = cfg.tg_ack_prefix
+
+    # ---------------------------------------------------------- инвайт-ссылка
+    # ВАЖНО: регистрируется ДО обычного /start, чтобы deep_link перехватывался
+    # первым (aiogram матчит хендлеры по порядку).
+    @router.message(CommandStart(deep_link=True))
+    async def cmd_start_invite(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        user = message.from_user
+        if user is None:
+            return
+        payload = ""
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) > 1:
+            payload = parts[1].strip()
+        if not payload.startswith("inv_"):
+            await message.answer("Не понимаю эту ссылку. Запустите бота командой /start.")
+            return
+        token = payload[len("inv_"):]
+        status, invite, account = store.redeem_invite(
+            token, user.id, user.full_name or "", user.username)
+
+        if status == "invalid":
+            await message.answer(INVALID_LINK_TEXT)
+            return
+        if status == "expired":
+            await message.answer(EXPIRED_LINK_TEXT)
+            return
+        if status == "exhausted":
+            await message.answer(
+                "Эта ссылка уже использована (или исчерпала лимит активаций). "
+                "Запросите новую у администратора.")
+            return
+        if status == "no_account":
+            await message.answer(
+                "Аккаунт, к которому вела ссылка, удалён. Обратитесь к администратору.")
+            return
+
+        # успех
+        acc_name = account.name
+        if status == "ok_owner":
+            await message.answer(
+                f"👑 Вы подключены как ВЛАДЕЛЕЦ аккаунта MAX «{acc_name}».\n\n"
+                "Сюда будут приходить все входящие из чата MAX (текст и фото), и вы "
+                "можете отвечать в MAX:\n"
+                "• Reply на присланное сообщение (текст/фото) — уйдёт ответом в MAX;\n"
+                f"• или начало строки с префикса {', '.join(cfg.tg_send_prefixes)}.\n\n"
+                f"Ваш user id: `{user.id}`."
+            )
+        else:
+            await message.answer(
+                f"👀 Вы подключены к аккаунту MAX «{acc_name}» в режиме ЧТЕНИЯ.\n\n"
+                "Сюда будут приходить сообщения и фото из чата MAX.\n"
+                "Отвечать в MAX может только владелец аккаунта — вам доступен "
+                "только просмотр."
+            )
+        await _notify_admin_invite(tg, cfg, invite, account, user, status)
 
     # ---------------------------------------------------------- приветствие
     @router.message(CommandStart())
