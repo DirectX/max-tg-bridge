@@ -8,6 +8,7 @@ tests/test_store_and_invites.py
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 import time
 
@@ -79,7 +80,8 @@ class TestInvites:
         inv = store.create_invite(acc.id, "listener", max_uses=1)
         assert inv["max_uses"] == 1 and inv["used_count"] == 0
         assert inv["expires_at"] is None
-        assert len(inv["token"]) >= 16 and inv["token"].isalnum() or "-" in inv["token"]
+        # token_urlsafe -> base64url: буквы, цифры и «-»/«_» (иногда оба)
+        assert re.fullmatch(r"[A-Za-z0-9_-]{16,}", inv["token"]), inv["token"]
 
         status, row, account = store.redeem_invite(inv["token"], 201, "Анна", "anna_s")
         assert status == "ok_listener" and account.id == acc.id
@@ -87,6 +89,12 @@ class TestInvites:
         # второй переход — уже исчерпан
         assert store.redeem_invite(inv["token"], 202, "Вася", None)[0] == "exhausted"
         assert store.is_listener(acc.id, 201) and not store.is_listener(acc.id, 202)
+
+    def test_tokens_unique(self, store):
+        """1000 токенов без коллизий (secrets.token_urlsafe(16) = 128 бит)."""
+        acc = store.create_account("5Б", chat_title="9 Б", owner_tg_id=100)
+        tokens = {store.create_invite(acc.id, "listener")["token"] for _ in range(1000)}
+        assert len(tokens) == 1000
 
     def test_multi_use_link(self, store):
         acc = store.create_account("5Б", chat_title="9 Б", owner_tg_id=100)

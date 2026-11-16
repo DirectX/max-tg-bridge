@@ -16,7 +16,14 @@ services:
       context: .
       dockerfile: Dockerfile
     image: max-tg-bridge:2
-    platform: linux/arm64
+    # Архитектура образа. По умолчанию — нативная для Orange Pi (linux/arm64):
+    # пиннинг защищает от случайного запуска amd64 через эмуляцию на плате.
+    #
+    # Сборка/запуск на x86_64-машине (разработка, отладка селекторов):
+    #   BRIDGE_PLATFORM=linux/amd64 docker compose up -d --build
+    # Либо соберите arm64-образ НА x86 через QEMU (для переноса на плату):
+    #   docker run --privileged --rm tonistiigi/binfmt --install arm64
+    platform: ${BRIDGE_PLATFORM:-linux/arm64}
     container_name: max-tg-bridge
 
     env_file:

@@ -133,11 +133,20 @@ max-tg-bridge/
 git clone <repo> && cd max-tg-bridge
 cp .env.example .env && nano .env      # TG_BOT_TOKEN, TG_API_BASE, ADMIN_TG_ID
 chmod 600 .env
-mkdir -p data/{profiles,state,tmp,logs}
+mkdir -p data/{profiles,state,tmp,logs,backups}
 
 docker compose up -d --build
 docker compose logs -f bridge
 ```
+
+> **Не на Orange Pi?** Жёсткий `platform: linux/arm64` в compose на x86-машине
+> даёт `exec /bin/sh: exec format error` (контейнер тянет arm64-бинарники без
+> эмуляции). Варианты:
+> - **разработка/отладка на x86:** `BRIDGE_PLATFORM=linux/amd64 docker compose up -d --build`
+>   (базовый Playwright-образ мультиарх, всё нативно; том `data/` переносим на плату потом);
+> - **собрать arm64-образ на x86 для переноса:** один раз
+>   `docker run --privileged --rm tonistiigi/binfmt --install arm64`, затем
+>   `docker buildx build --platform linux/arm64 -t max-tg-bridge:2 --load .`.
 
 Nginx-реверс Telegram API — как в v1, конфиг в
 [`nginx/telegram-api.conf.example`](nginx/telegram-api.conf.example)

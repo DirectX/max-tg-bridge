@@ -9,10 +9,16 @@
 #  ВНИМАНИЕ: тег образа ДОЛЖЕН совпадать с версией playwright в
 #  requirements.txt (сейчас 1.49.0). Обновляйте синхронно в обоих местах.
 #
-#  Сборка на самой плате не нужна — соберите на x86-сервере/ноутбуке:
-#     docker buildx build --platform linux/arm64 -t max-tg-bridge:latest --load .
-#  ...или просто `docker compose up -d --build` на плате (compose укажет
-#  platform: linux/arm64 и образ подтянется/соберётся сам).
+#  Варианты сборки (v2.2):
+#   1) НА ПЛАТЕ arm64 (нативно):      docker compose up -d --build
+#   2) НА x86 ДЛЯ РАЗРАБОТКИ (нативно, без эмуляции — базовый образ мультиарх):
+#        BRIDGE_PLATFORM=linux/amd64 docker compose up -d --build
+#   3) НА x86 ПОД ПЕРЕНОС НА ПЛАТУ — сначала один раз включить QEMU binfmt:
+#        docker run --privileged --rm tonistiigi/binfmt --install arm64
+#        docker buildx build --platform linux/arm64 -t max-tg-bridge:2 --load .
+#      Без binfmt сборка arm64 на x86-хосте падает на первом же RUN:
+#      «exec /bin/sh: exec format error».
+#  Платформа задаётся переменной BRIDGE_PLATFORM (compose по умолчанию arm64).
 # ============================================================================
 
 FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
@@ -20,7 +26,7 @@ FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 #--- Мета -------------------------------------------------------------------
 LABEL org.opencontainers.image.title="max-telegram-bridge-v2" \
       org.opencontainers.image.description="24/7 Multi-Account мост web.max.ru <-> Telegram (Playwright + aiogram)" \
-      org.opencontainers.image.architecture="arm64"
+      org.opencontainers.image.architecture="arm64 (default), amd64 via BRIDGE_PLATFORM"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
