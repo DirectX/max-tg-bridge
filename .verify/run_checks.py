@@ -29,6 +29,7 @@ os.environ.update({
     "DB_PATH": str(WORK / "state" / "bridge.db"),
     "BROWSER_LOG": str(WORK / "logs" / "browser.log"),
     "SCREENSHOTS_DIR": str(WORK / "logs"),
+    "BACKUPS_DIR": str(WORK / "backups"),
 })
 
 sys.path.insert(0, str(STUBS))
@@ -50,6 +51,7 @@ def check(name):
                 "TMP_DIR": str(wd / "tmp"),
                 "BROWSER_LOG": str(wd / "logs" / "browser.log"),
                 "SCREENSHOTS_DIR": str(wd / "logs"),
+                "BACKUPS_DIR": str(wd / "backups"),
             })
             try:
                 fn()

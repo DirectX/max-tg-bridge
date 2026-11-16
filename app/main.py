@@ -32,6 +32,7 @@ import sys
 from aiogram import Router
 
 from .account_manager import AccountManager
+from .backup import backup_scheduler
 from .config import load_config
 from .store import Store
 from .tg import admin_handlers, auth_fsm, user_handlers
@@ -49,6 +50,7 @@ class Runtime:
         self.mgr = AccountManager(self.cfg, self.store, self.tg)
         self._shutdown = asyncio.Event()
         self._polling: asyncio.Task | None = None
+        self._backup_task: asyncio.Task | None = None
 
     async def run(self) -> None:
         # ---- роутеры (порядок обязателен) --------------------------------
@@ -71,9 +73,24 @@ class Runtime:
         await self.mgr.start_all()
 
         self._polling = asyncio.create_task(self.tg.run_polling(), name="tg_polling")
+        # v2.2: суточный бэкап (04:00 — после ночных релоадов страниц).
+        # Падение планировщика не роняет мост: только лог + уведомление админу.
+        self._backup_task = asyncio.create_task(
+            self._guarded_backup(), name="backup_scheduler")
         log.info("Мост v2 работает. Аккаунтов в работе: %s",
                  self.mgr.running_ids())
         await self._shutdown.wait()
+
+    async def _guarded_backup(self) -> None:
+        try:
+            await backup_scheduler(self.cfg, self.store, self.tg, self._shutdown)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("Бэкап-планировщик упал — мост продолжает работать")
+            with contextlib.suppress(Exception):
+                await self.tg.notify_admin(
+                    "⚠️ Планировщик бэкапов упал (см. логи). Ручной бэкап: /backup")
 
     def request_shutdown(self) -> None:
         self._shutdown.set()
@@ -84,6 +101,13 @@ class Runtime:
             self._polling.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._polling
+        # планировщик бэкапов сам выходит по _shutdown, но если он сейчас
+        # посреди сборки архива — гасим и ждём: поток читает store, а store
+        # закрывается строкой ниже
+        if self._backup_task:
+            self._backup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._backup_task
         await self.mgr.shutdown()
         await self.tg.close()
         self.store.close()

@@ -34,9 +34,10 @@ WORKDIR /app
 
 #--- Системные дополнения ----------------------------------------------------
 # Официальный образ Playwright уже содержит Xvfb и все библиотеки Chromium.
-# Добавляем только x11vnc — «глазки» для ручного прохождения капчи/QR (опция).
+# openssl  — шифрование архивов бэкапа (AES-256-CBC + PBKDF2), см. app/backup.py;
+# x11vnc   — «глазки» для ручного прохождения капчи/QR (опция).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends x11vnc \
+ && apt-get install -y --no-install-recommends openssl x11vnc \
  && rm -rf /var/lib/apt/lists/*
 
 #--- Код приложения ----------------------------------------------------------
@@ -45,16 +46,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY scripts ./scripts
+COPY tests ./tests
+COPY pytest.ini ./
 COPY scripts/xvfb-start.sh /usr/local/bin/xvfb-start.sh
 RUN chmod +x /usr/local/bin/xvfb-start.sh ./scripts/*.sh
 
 #--- Каталог данных ----------------------------------------------------------
 # /data монтируется томом из docker-compose:
 #   /data/profiles        — изолированные профили: account_1/, account_2/, .trash/
-#   /data/state           — sqlite v2 (роли, аккаунты, дедуп, маппинги)
-#   /data/tmp             — временные файлы картинок из Telegram
+#   /data/state           — sqlite v3 (роли, аккаунты, инвайты, дедуп, маппинги)
+#   /data/tmp             — временные файлы (картинки TG, сборка архива бэкапа)
 #   /data/logs            — browser_a<N>.log, скриншоты auth_a<N>_*.png
-RUN mkdir -p /data/profiles /data/state /data/tmp /data/logs
+#   /data/backups         — суточные архивы bridge_YYYYMMDD_HHMMSS.tar.gz[.enc]
+RUN mkdir -p /data/profiles /data/state /data/tmp /data/logs /data/backups
 
 #--- Безопасность ------------------------------------------------------------
 # Официальный образ playwright работает под root; нам это безразлично
@@ -71,7 +75,12 @@ RUN mkdir -p /data/profiles /data/state /data/tmp /data/logs
 HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=5 \
     CMD python -c "import pathlib,sys; sys.exit(0 if (pathlib.Path('/data/state').exists() and pathlib.Path('/data/profiles').exists()) else 1)" || exit 1
 
+# Тестовые зависимости (pytest, pytest-asyncio) уже в requirements.txt —
+# слой выше установлен вместе с ними, поэтому отдельного шага нет.
+
 # Основной режим. Авторизация аккаунтов — из Telegram (/admin → Добавить).
 # Аварийный консольный вход:
 #   docker compose run --rm bridge python -m app.auth --list
+# Тесты (зависимости уже в образе):
+#   docker compose run --rm bridge pytest
 CMD ["python", "-m", "app.main"]

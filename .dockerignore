@@ -9,9 +9,7 @@ __pycache__/
 .venv/
 venv/
 .test_js_bridge.js
-migrations/
-nginx/
-tests/
-README.md
-
+.pytest_cache/
 .verify/
+nginx/
+README.md

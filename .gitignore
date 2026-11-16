@@ -4,7 +4,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-.test_js_bridge.js
-tests/__pycache__/
 
+# офлайн-проверки: рабочие каталоги и вендоренные зависимости
 .verify/work/
+.verify/pytestlibs/
+.pytest_cache/
+.test_js_bridge.js

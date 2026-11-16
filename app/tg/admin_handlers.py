@@ -80,9 +80,10 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             await callback.message.answer(text, reply_markup=kb)
 
     # ================================================================ /admin
-    # OR-логика: aiogram объединяет позиционные фильтры через AND, поэтому
-    # «/admin» и «/status» — один фильтр-or (иначе /status не матчился бы никогда)
-    @router.message(Command("admin") | Command("status"))
+    # ОДИН Command c несколькими именами — это и есть «или»: aiogram
+    # объединяет позиционные фильтры через AND, а Command("admin") | Command(...)
+    # не поддерживается (у Filter нет __or__). Оба алиаса матчатся здесь.
+    @router.message(Command("admin", "status"))
     async def cmd_admin(message: Message) -> None:
         if not _admin(message=message):
             await message.answer("⛔ Доступ только для супер-администратора.")
@@ -121,6 +122,51 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         if not _admin(callback=callback):
             return
         await _edit_or_send(callback, _render_system(cfg, store, mgr))
+
+    # ---------------------------------------------------- v2.2 бэкапы
+    @router.callback_query(F.data == "bak")
+    async def cb_backup_now(callback: CallbackQuery) -> None:
+        await callback.answer("Бэкап запущен")
+        if not _admin(callback=callback):
+            return
+        await _run_backup(callback.message, callback.from_user.id)
+
+    @router.message(Command("backup"))
+    async def cmd_backup(message: Message) -> None:
+        if not _admin(message=message):
+            await message.answer("⛔ Доступ только для супер-администратора.")
+            return
+        await _run_backup(message, message.from_user.id)
+
+    async def _run_backup(message: Message, chat_id: int) -> None:
+        """Общий путь кнопки и команды: тяжёлая часть вне event loop."""
+        from ..backup import backup_now
+
+        note = await message.answer(f"{cfg.tg_ack_prefix} 💾 Собираю бэкап…")
+        try:
+            res = await backup_now(cfg, store, tg)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Ручной бэкап упал")
+            await note.edit_text(f"⛔ Бэкап не удался: {exc}")
+            return
+        if not res.ok:
+            await note.edit_text(f"⛔ Бэкап не удался: {res.warning}")
+            return
+        m = res.manifest
+        text = (
+            f"💾 Бэкап готов: <code>{res.path.name}</code>\n"
+            f"Размер: {res.human_size()}" + (" (AES-256)" if res.encrypted else "") + "\n"
+            f"Аккаунтов: {m.get('accounts_active', 0)} активных из "
+            f"{m.get('accounts_total', 0)}, слушателей: {m.get('listeners', 0)}\n"
+            f"Профили: {', '.join(m.get('profiles', [])) or '—'}\n"
+            + (f"📤 Архив отправлен вам документом выше.\n" if res.sent else
+               f"📁 Только на диске: <code>{res.path}</code>\n")
+            + (f"⚠ {res.warning}\n" if res.warning else "")
+            + f"Восстановление: <code>scripts/restore.py {res.path.name}"
+              + (" --password …" if res.encrypted else "") + " --apply</code>"
+        )
+        await note.edit_text(text, parse_mode="HTML")
+
 
     # -------------------------------------------------------------- аккаунт
     @router.callback_query(F.data.startswith("acc:"))

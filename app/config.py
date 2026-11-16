@@ -70,6 +70,10 @@ def _csv(name: str, default: str = "") -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+# Telegram Bot API: загрузка файлов ботом — 50 МБ. Не настраивается сверх.
+TG_SEND_HARD_LIMIT_MB = 50
+
+
 @dataclass(slots=True)
 class Config:
     # ----------------------------- Telegram (транспорт) -------------------
@@ -124,6 +128,14 @@ class Config:
     keepalive_interval: float = 90.0
     # Авторизационная сессия без активности админа — авто-отмена
     auth_idle_timeout: float = 15 * 60.0
+
+    # ----------------------------- v2.2 бэкапы ----------------------------
+    backups_dir: Path = field(default_factory=lambda: Path("/data/backups"))
+    backup_hour: int = 4                  # суточная копия в 04:00 (после релоадов)
+    backup_keep: int = 7                  # локальная ротация: последние 7 копий
+    backup_password: str = ""             # пусто = без шифрования; задан = AES-256
+    backup_send_max_mb: int = 50          # жёсткий потолок Bot API — 50 МБ
+    backup_include_trash: bool = False    # брать в архив profiles/.trash/
 
     # ------------------------------------------------------------------
     @classmethod
@@ -181,13 +193,24 @@ class Config:
             poll_interval=_float("MAX_POLL_INTERVAL", 0.7),
             keepalive_interval=_float("MAX_KEEPALIVE_INTERVAL", 90.0),
             auth_idle_timeout=_float("AUTH_IDLE_TIMEOUT", 900.0),
+            backups_dir=Path(_opt("BACKUPS_DIR", "/data/backups")),
+            backup_hour=_int("BACKUP_HOUR", 4),
+            backup_keep=_int("BACKUP_KEEP", 7),
+            backup_password=_opt("BACKUP_PASSWORD"),
+            backup_send_max_mb=_int("BACKUP_SEND_MAX_MB", 50),
+            backup_include_trash=_bool("BACKUP_INCLUDE_TRASH", False),
         )
+        if cfg.backup_send_max_mb > TG_SEND_HARD_LIMIT_MB:
+            print(f"[config] BACKUP_SEND_MAX_MB={cfg.backup_send_max_mb} урезан до "
+                  f"{TG_SEND_HARD_LIMIT_MB} (лимит Bot API на загрузку файлов ботом)")
+            cfg.backup_send_max_mb = TG_SEND_HARD_LIMIT_MB
         return cfg
 
     def ensure_dirs(self) -> None:
         try:
             for path in (self.profiles_root, self.trash_root, self.tmp_dir,
-                         self.db_path.parent, self.browser_log.parent):
+                         self.db_path.parent, self.browser_log.parent,
+                         self.backups_dir):
                 path.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise SystemExit(

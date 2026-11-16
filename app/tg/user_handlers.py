@@ -168,7 +168,7 @@ def register(router: Router, cfg, store, tg, mgr) -> None:
 
     # ------------------------------------------------------------- входящие
     @router.message(F.chat.type == "private",
-                    ~Command("start", "id", "help", "admin", "status"))
+                    ~Command("start", "id", "help", "admin", "status", "backup"))
     async def on_incoming(message: Message, state: FSMContext) -> None:
         user = message.from_user
         if user is None or user.is_bot:
@@ -267,10 +267,9 @@ def register(router: Router, cfg, store, tg, mgr) -> None:
             await tg.throttled_ack(uid, note, window_s=0, key=uid)
             return
         # несколько аккаунтов — inline-выбор + черновик в FSM
-        from aiogram.types import InlineKeyboardButton
+        from .keyboards import btn
         kb = account_picker(owned, prefix="pick")
-        kb.inline_keyboard.append(
-            [InlineKeyboardButton("✖️ Отмена", callback_data="pick_cancel")])
+        kb.inline_keyboard.append([btn("✖️ Отмена", callback_data="pick_cancel")])
         await state.set_state(UserFlow.pending_choice)
         await state.update_data(pending_out=asdict(out))
         await tg.bot.send_message(

@@ -1,4 +1,4 @@
-# MAX ⇄ Telegram Bridge v2.1 — Multi-Account, Role-Based, Invite Links
+# MAX ⇄ Telegram Bridge v2.2 — Multi-Account, Invites, Backups & Tests
 
 Мост между веб-клиентом мессенджера **MAX** (`https://web.max.ru`) и
 **Telegram** для школьных чатов. Версия 2.0 переносит управление аккаунтами
@@ -29,6 +29,18 @@
  │        fanout-map              строго через TG_API_BASE ─────────────┼──► Nginx ─► api.telegram.org
  └──────────────────────────────────────────────────────────────────────┘
 ```
+
+### Что нового в 2.2 — бэкапы и автотесты
+
+| Возможность | Как |
+|---|---|
+| **Консистентный дамп SQLite** | `sqlite3.Connection.backup()` (не `shutil.copy`!) + `PRAGMA quick_check` дампа; обычные профили Chromium весят сотни МБ — их кеши исключаем |
+| **Архив профилей** | tar.gz `profiles/account_*/` без `Cache`/`Code Cache`/`GPUCache`/`Crashpad`/`blob_storage`/… — единицы МБ вместо сотен |
+| **Шифрование** | опция `BACKUP_PASSWORD` → `openssl aes-256-cbc -pbkdf2` (пароль через env подпроцесса, не argv) |
+| **Расписание + ротация** | фоновая задача в 04:00 (после ночных релоадов), хранятся последние `BACKUP_KEEP` (7) копий |
+| **Доставка в Telegram** | кнопка «💾 Бэкап сейчас» и `/backup` → архив документом супер-админу; >50 МБ (лимит Bot API) остаётся на диске |
+| **Восстановление** | `scripts/restore.py` с защитой от path-traversal, `--inspect`, dry-run по умолчанию |
+| **Автотесты** | pytest + pytest-asyncio: 78 тестов store/invites/routing/backup без браузера и сети |
 
 ### Что нового в 2.1 — инвайт-ссылки
 
@@ -64,7 +76,7 @@
 ```
 max-tg-bridge/
 ├── app/
-│   ├── main.py              # сборка runtime; порядок роутеров: auth → admin → user
+│   ├── main.py              # сборка runtime; роутеры + планировщик бэкапов
 │   ├── account_manager.py   # супервизор аккаунтов + auth-сессии + статусы
 │   ├── bridge.py            # AccountWorker: MAX ⇄ fanout ⇄ владелец/слушатели
 │   ├── browser.py           # AccountBrowser: изолированный persistent-context
@@ -73,6 +85,7 @@ max-tg-bridge/
 │   ├── auth.py              # аварийный консольный вход (CLI поверх менеджера)
 │   ├── config.py            # ENV: инфраструктура + дефолты (роли — уже в БД!)
 │   ├── store.py             # SQLite v3 (роли+инвайты) + авто-миграции схемы
+│   ├── backup.py            # v2.2: дамп SQLite, tar профилей, openssl-AES, ротация
 │   ├── utils.py             # retry, human-delay, normalize_phone, read_ram_mb
 │   └── tg/
 │       ├── bot.py           # ProxiedAiohttpSession + транспорт (per-user sends)
@@ -83,12 +96,19 @@ max-tg-bridge/
 │       └── user_handlers.py # /start inv_<token>, reply/префиксы, заглушки слушателям
 ├── migrations/0002_role_based_multiaccount.sql   # справочная схема v2
 ├── migrations/0003_invites.sql               # v2→v3: таблица invites + колонки listeners
+├── pytest.ini                       # asyncio_mode=auto, testpaths=tests
+├── docker-compose.test.yml          # overlay для автотестов (profile: tests)
 ├── nginx/telegram-api.conf.example
 ├── scripts/migrate_v1.py    # миграция данных и профиля с v1
 ├── scripts/xvfb-start.sh    # Xvfb + x11vnc (ручная капча)
-├── tests/                   # JS-тест моста чтения (переехал из v1 без изменений)
+├── tests/                   # pytest-набор v2.2 + JS-тест моста чтения (v1)
+│   ├── conftest.py, fakes.py    # изолированные sandbox-фикстуры и фейки TG
+│   ├── test_store_and_invites.py
+│   ├── test_routing_and_roles.py
+│   ├── test_backup.py
+│   └── run_js_bridge_test.sh, test_max_dom_bridge.js
 ├── .verify/                 # офлайн-верификация (заглушки deps + 16 проверок)
-├── data/{profiles,state,tmp,logs}/
+├── data/{profiles,state,tmp,logs,backups}/
 ├── Dockerfile               # mcr.microsoft.com/playwright/python (arm64)
 ├── docker-compose.yml       # platform arm64, shm_size 4gb, лимит 8G
 └── .env.example
@@ -332,7 +352,117 @@ UPDATE invites SET used_count = used_count + 1
 Эхо-защита от петли: собственные сообщения не пересылаются (mine-маркеры,
 `max_self_name`, окно хэшей исходящих 90 с).
 
-## 10. Офлайн-верификация
+## 10. Резервные копии (v2.2)
+
+### Состав архива
+
+```
+bridge_20261116_040000.tar.gz          (или .tar.gz.enc при BACKUP_PASSWORD)
+├── MANIFEST.json                      # версия схемы/моста, состав, счётчики
+├── db/bridge.db                       # КОНСИСТЕНТНЫЙ дамп SQLite
+└── profiles/
+    ├── account_1/Default/Cookies      # живые сессии MAX: Cookies,
+    ├── account_1/Default/Local Storage/…   Local Storage, IndexedDB,
+    └── account_2/…                    # Session Storage — всё на месте
+```
+
+Из архива **исключены** регенерируемые папки Chromium: `Cache`, `Code Cache`,
+`GPUCache`, `DawnCache`, `ShaderCache`, `Crashpad`, `blob_storage`,
+`Service Worker`, `component_crx_cache`, `Safe Browsing` и др. (полный список
+— `EXCLUDED_DIRS` в [`app/backup.py`](app/backup.py)), а также лок-файлы
+живой сессии (`SingletonLock/Socket/Cookie`, `LOCK`, `DevToolsActivePort`).
+Типичный архив 2–5 аккаунтов весит 1–5 МБ.
+
+Дамп БД делается через `sqlite3.Connection.backup()`, а не копированием
+файла: copy main-файла без `-wal` теряет последние транзакции и иногда даёт
+побитый файл. Дамп проверяется `PRAGMA quick_check` до упаковки.
+
+### Когда и куда
+
+* **Суточно** — фоновая задача `backup_scheduler` в `BACKUP_HOUR` (по
+  умолчанию **04:00**, после плановых ночных релоадов страниц в 03:00+N*7 мин).
+  Падение планировщика мост не роняет: лог + уведомление админу.
+* **Вручную** — `/admin → 💾 Бэкап сейчас` или команда `/backup`.
+* **Локально** — `/data/backups/` (том `./data/backups`), ротация: последние
+  `BACKUP_KEEP` (по умолчанию 7) копий, остальные удаляются.
+* **В Telegram** — архив отправляется документом супер-админу через наш же
+  Nginx-прокси с подписью (дата, размер, активные аккаунты, слушатели,
+  список профилей). Ограничение Bot API на загрузку — **50 МБ**: при
+  превышении архив остаётся на диске, а бот шлёт путь и предупреждение.
+  Порог настраивается `BACKUP_SEND_MAX_MB` (выше 50 не поднимается).
+
+### Шифрование
+
+`BACKUP_PASSWORD` (в `.env`, `chmod 600`) включает `openssl enc -aes-256-cbc
+-pbkdf2 -salt`: внутри лежат **живые сессии MAX**, и незашифрованный архив,
+уплывший куда-то кроме этого диска, равен утечке аккаунта. Пароль передаётся
+подпроцессу через переменную окружения, а не argv — не светится в `ps`.
+Если openssl вдруг нет в образе — бэкап делается незашифрованным и в отчёте
+явно возвращается предупреждение (тише воды, чем молчаливая потеря).
+
+### Восстановление
+
+```bash
+# осмотреть архив, ничего не трогая
+docker compose run --rm bridge python scripts/restore.py \
+    /data/backups/bridge_20261116_040000.tar.gz --inspect
+
+# dry-run: распаковать во временную папку и показать дерево
+docker compose run --rm bridge python scripts/restore.py bridge_20261116_040000.tar.gz
+
+# боевое восстановление (сначала остановить мост!)
+docker compose down
+docker compose run --rm bridge python scripts/restore.py \
+    /data/backups/bridge_20261116_040000.tar.gz.enc \
+    --password "$BACKUP_PASSWORD" --data-root /data --apply
+docker compose up -d
+```
+
+`restore.py` по умолчанию **ничего не перезаписывает**: существующая БД
+сохраняется как `bridge.db.pre-restore-<ts>`, существующие профили
+пропускаются (чтобы затереть — `--clean-existing`). Экстракция защищена от
+path traversal (`../`, абсолютные пути, симлинки наружу, спецфайлы).
+Восстановление профиля на другой машине обычно безопасно: Chromium сам
+мигрирует формат, но если MAX сочтёт сессию подозрительной — аккаунт попросит
+переавторизацию, это штатный путь (`/admin → 🔑 Переавторизовать`).
+
+## 11. Автотесты (v2.2)
+
+pytest + pytest-asyncio, без браузера и без сети: 78 тестов покрывают
+критическую бизнес-логику.
+
+```bash
+# внутри Docker — зависимости уже в образе, работает из коробки:
+docker compose run --rm bridge pytest
+
+# отдельный контейнер только для тестов (не трогает тома боевого моста):
+docker compose -f docker-compose.yml -f docker-compose.test.yml \
+    --profile tests run --rm tests
+
+# локально (нужны aiogram/playwright/pytest в окружении)
+python3 -m pytest tests -q
+
+# JS-мост чтения (node, без браузера)
+bash tests/run_js_bridge_test.sh
+```
+
+| Файл | Что проверяет |
+|---|---|
+| [`tests/test_store_and_invites.py`](tests/test_store_and_invites.py) | CRUD аккаунтов/слушателей, каскады, одноразовые/многоразовые/безлимитные инвайты, `expires_at`, отзыв, FK-каскад, миграция v2→v3 без потери данных; **гонка**: 2 и 10 корутин (`asyncio.gather`) по одноразовой ссылке → ровно один успех, `used_count == 1` |
+| [`tests/test_routing_and_roles.py`](tests/test_routing_and_roles.py) | фан-аут Владельцу+Слушателям с **разными** `tg_message_id` в `message_map`; изоляция аккаунтов (А не течёт в Б); дедуп, mine/self-name/эхо-окно; **настоящие хендлеры** из `register()` вызываются моками: reply Владельца уходит в очередь MAX, reply Слушателя блокируется «только чтение», `/admin`/`/backup` от не-админа отклоняются и не трогают диск; порядок регистрации deep_link-/start |
+| [`tests/test_backup.py`](tests/test_backup.py) | консистентность дампа SQLite (включая **нечекпоинутый WAL**), источник не модифицируется; кеш-папки исключены, сессии внутри; симлинки не следуют; openssl round-trip и неверный пароль; ротация; лимит 50 МБ (архив > лимита остаётся на диске); **round-trip**: восстановление БД из архива → роли/дедуп/маппинги целы |
+
+Тесты на реальных библиотеках вскрыли два бака продакшн-кода, которые
+заглушки не видели: **позиционные** `InlineKeyboardButton("текст", …)`
+(pydantic-модель принимает только keyword-аргументы → все инлайн-меню падали
+при первом же клике) и `Command("admin") | Command("status")` (такого
+оператора у фильтров aiogram нет → регистрация роутера админа падала
+на старте). Оба исправлены: кнопки создаются только через фабрику `btn()`,
+алиасы команд — одним `Command("admin", "status")`. Поэтому набор гоняется
+на настоящих aiogram/playwright, а `.verify/run_checks.py` (16 проверок на
+заглушках) остаётся быстрым вариантом без зависимостей.
+
+## 12. Офлайн-верификация (.verify — без зависимостей)
 
 Всё хрупкое (роутеры, миграции БД, фан-аут, супервизор, инвайты) покрыто
 прогоном без браузера и без установленного aiogram/playwright:
@@ -350,7 +480,7 @@ AccountManager (включая переезд профиля в `.trash/`), CRUD
 по одноразовой ссылке** (ровно один успех). Гоняйте после любой правки
 store/bridge/account_manager/tg.
 
-## 11. Селекторы и отладка
+## 13. Селекторы и отладка
 
 * Все селекторы — в [`app/selectors.py`](app/selectors.py) (как в v1, гайд
   DevTools внутри файла). Логи теперь **на аккаунт**: `data/logs/browser_a<N>.log`,
@@ -370,7 +500,7 @@ store/bridge/account_manager/tg.
 
 Логи: `docker compose logs -f bridge`; пер-аккаунтные: `tail -f data/logs/browser_a2.log`.
 
-## 12. Безопасность
+## 14. Безопасность
 
 * `.env` (токен бота, `ADMIN_TG_ID`, резидуальные телефоны) — `chmod 600`,
   в `.gitignore`, попадает в контейнер только через `env_file`.
@@ -378,12 +508,12 @@ store/bridge/account_manager/tg.
   бэкапы шифруем. `ADMIN_TG_ID` — единая точка власти; компрометация этого
   аккаунта Telegram = компрометация всех аккаунтов MAX. Бот-приглашения
   слушателей не дают никаких прав на запись.
-* ВNC — только bind на `127.0.0.1` + SSH-туннель + пароль, только на время
+* VNC — только bind на `127.0.0.1` + SSH-туннель + пароль, только на время
   ручной капчи.
 * Удаление аккаунта не уничтожает профиль сразу — он переезжает в
   `data/profiles/.trash/` (ручная зачистка).
 
-## 13. Известные ограничения
+## 15. Известные ограничения
 
 * Ответы Слушателей не буферизуются «на потом, станет владельцем» — право
   ответа неотчуждаемо от аккаунта.
@@ -396,3 +526,10 @@ store/bridge/account_manager/tg.
   «Переавторизовать» перезапускает сценарий).
 * MAX не имеет официального Bot API — это UI-автоматизация вашего аккаунта;
   редкие просьбы войти по коду — норма, профиль сводит их к минимуму.
+* Бэкап — не репликация: архив это снапшот, а не потоковая копия. Между
+  ночными запусками окно потери — до суток (плюс ручная кнопка `/backup`).
+  Доставленный в Telegram архив шифруется только при заданном
+  `BACKUP_PASSWORD`; без пароля архив улетает наружу в открытом виде.
+* Восстановление профиля на другой машине/архитектуре обычно работает, но
+  MAX может счесть сессию подозрительной и попросить переавторизацию —
+  данные при этом не теряются.

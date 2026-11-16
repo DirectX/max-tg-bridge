@@ -163,9 +163,10 @@ class AccountManager:
     async def _notify_auth_required(self, acc: Account | None) -> None:
         if acc is None:
             return
-        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-            f"🔑 Переавторизовать «{acc.name}»", callback_data=f"relogin:{acc.id}")]])
+        from aiogram.types import InlineKeyboardMarkup
+        from .tg.keyboards import btn
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            btn(f"🔑 Переавторизовать «{acc.name}»", callback_data=f"relogin:{acc.id}")]])
         await self.tg.notify_admin(
             f"🔴 Сессия MAX аккаунта «{acc.name}» истекла "
             f"(чат: {acc.max_chat_title or '—'}).\n"

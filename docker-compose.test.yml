@@ -1,0 +1,29 @@
+# Overlay для автотестов v2.2.
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml run --rm tests
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml build
+#
+# Отдельный контейнер НЕ трогает тома боевого моста: тесты создают свои
+# tmp_path, поэтому volumes у tests-сервиса пустые.
+services:
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: max-tg-bridge:test
+    platform: linux/arm64
+    profiles: ["tests"]
+    environment:
+      # значения не важны (тесты изолированы в tmp_path), но config их читает:
+      TG_BOT_TOKEN: "123:test"
+      TG_API_BASE: "https://tg.test.invalid"
+      ADMIN_TG_ID: "1"
+      PROFILES_ROOT: /tmp/t/profiles
+      TRASH_ROOT: /tmp/t/profiles/.trash
+      TMP_DIR: /tmp/t/tmp
+      DB_PATH: /tmp/t/state/bridge.db
+      BROWSER_LOG: /tmp/t/logs/browser.log
+      SCREENSHOTS_DIR: /tmp/t/logs
+      BACKUPS_DIR: /tmp/t/backups
+    command: ["pytest", "-q"]
+    working_dir: /app
+    restart: "no"

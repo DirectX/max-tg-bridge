@@ -310,8 +310,10 @@ class Store:
 
     def delete_account(self, account_id: int) -> None:
         with self._lock, self._db:
-            # listeners/message_map/seen чистим явно: ON DELETE CASCADE зависит от PRAGMA
+            # listeners/invites/message_map/seen чистим явно: ON DELETE CASCADE
+            # зависит от PRAGMA foreign_keys, которое не всякий клиент ставит
             self._db.execute("DELETE FROM listeners WHERE account_id=?", (account_id,))
+            self._db.execute("DELETE FROM invites WHERE account_id=?", (account_id,))
             self._db.execute("DELETE FROM message_map WHERE account_id=?", (account_id,))
             self._db.execute("DELETE FROM seen_message WHERE account_id=?", (account_id,))
             self._db.execute("DELETE FROM stats WHERE account_id=?", (account_id,))
@@ -626,6 +628,19 @@ class Store:
                 self._apply_listener(account.id, tg_user_id, "", username, full_name)
                 status = "ok_listener"
         return status, invite, account
+
+    async def redeem_invite_async(self, token: str, tg_user_id: int,
+                                   full_name: str, username: str | None):
+        """Async-обёртка redeem_invite для вызова из event loop моста/тестов.
+
+        sqlite-блокировка захватывает только запись в БД (микросекунды), но
+        держать её в loop-потоке нельзя: уводим в to_thread. Гонка двух
+        корутин по одноразовому токену разрешается корректно: обе попадают
+        в разные потоки, вторая видит уже used_count=1 (BEGIN IMMEDIATE).
+        """
+        import asyncio
+        return await asyncio.to_thread(self.redeem_invite, token, tg_user_id,
+                                       full_name, username)
 
     # ================================================================ house
     def _purge_old(self) -> None:

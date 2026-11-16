@@ -28,6 +28,7 @@ services:
       DB_PATH: /data/state/bridge.db
       BROWSER_LOG: /data/logs/browser.log
       SCREENSHOTS_DIR: /data/logs
+      BACKUPS_DIR: /data/backups
       TZ: Europe/Moscow
 
     # ===== Специфика N×Chromium в docker на ARM64 ==========================
@@ -47,6 +48,8 @@ services:
       - ./data/state:/data/state
       - ./data/tmp:/data/tmp
       - ./data/logs:/data/logs
+      # v2.2: суточные архивы бэкапа (bridge_*.tar.gz[.enc]), ротация BACKUP_KEEP
+      - ./data/backups:/data/backups
 
     restart: unless-stopped
     stop_grace_period: 40s
@@ -56,6 +59,9 @@ services:
       options:
         max-size: "8m"
         max-file: "3"
+
+    # v2.2: healthcheck из Dockerfile проверяет состояние; свежесть бэкапа
+    # контролирует сам планировщик (уведомление админу при сбое).
 
     deploy:
       resources:
