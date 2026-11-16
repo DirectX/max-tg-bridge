@@ -68,7 +68,9 @@ _mk("aiogram.client.session.aiohttp",
     AiohttpSession=type("A", (), {"__init__": lambda s, **k: None}))
 _mk("aiogram.exceptions", TelegramBadRequest=PwErr, TelegramRetryAfter=PwErr,
     TelegramForbiddenError=PwErr)
-_mk("aiogram.filters", Command=PH, CommandStart=PH)
+_mk("aiogram.filters", Command=PH, CommandStart=PH, StateFilter=type(
+    "StateFilter", (), {"__init__": lambda s, *a, **k: None,
+    "__invert__": lambda s: PH(), "__call__": lambda s, *a, **k: False}))
 _mk("aiogram.fsm")
 _mk("aiogram.fsm.context", FSMContext=object)
 _mk("aiogram.fsm.state", State=State, StatesGroup=StatesGroup)

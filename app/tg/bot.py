@@ -121,8 +121,13 @@ class TelegramCore:
         await self.dp.start_polling(self.bot, handle_signals=False)
 
     async def close(self) -> None:
+        # ВАЖНО: bot.close() — это НЕ освобождение ресурсов, а метод Telegram
+        # API «close» (logout): он лениво создаёт aiohttp-сессию, шлёт запрос и
+        # при недоступности прокси валится, оставляя сессию открытой ->
+        # «Unclosed client session» + SSL-мусор на закрытом loop.
+        # Ресурсы освобождает session.close() (сам ждёт 250 мс на SSL-коннекты).
         try:
-            await self.bot.close()
+            await self.bot.session.close()
         except Exception:  # noqa: BLE001
             pass
 

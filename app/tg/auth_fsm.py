@@ -22,7 +22,7 @@ app/tg/auth_fsm.py
 from __future__ import annotations
 
 from aiogram import F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.markdown import hbold
@@ -38,6 +38,8 @@ from .states import AuthFlow
 log = get_logger("tg.auth")
 
 CANCEL_HINT = "Отправьте «отмена» или /cancel."
+# слова отмены: единый источник правды для предиката и _is_cancel
+CANCEL_WORDS = frozenset({"отмена", "отменить", "cancel", "stop", "стоп", "/cancel"})
 
 
 class AuthController:
@@ -358,10 +360,21 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         if _is_admin(message):
             await _cancel(message, state)
 
-    # «отмена» текстом, когда состояние НЕ установлено (защита от залипания)
-    @router.message(F.text.lower().in_("отмена", "cancel") &
-                    ~AuthFlow.new_name & ~AuthFlow.new_chat &
-                    ~AuthFlow.new_owner & ~AuthFlow.phone & ~AuthFlow.code)
+    # «отмена» текстом, когда состояние НЕ установлено (защита от залипания).
+    # ВАЖНО (aiogram 3.x):
+    #   * MagicFilter.in_() принимает ОДИН контейнер, не *args;
+    #   * у State нет __invert__ -> «не в AuthFlow» выражается ~StateFilter(...),
+    #     который матчит и None-состояние;
+    #   * MagicFilter НЕЛЬЗЯ соединять «&» с обычным Filter: композит
+    #     «bool & _InvertFilter» падает TypeError при РАЗРЕШЕНИИ (регистрация
+    #     проходит молча!). Фильтры передаются позиционными аргументами —
+    #     фреймворк сам AND-их;
+    #   * F.text может быть None (фото) — предикат через .func с guard.
+    @router.message(
+        F.text.func(lambda t: bool(t) and t.strip().lower() in CANCEL_WORDS),
+        ~StateFilter(AuthFlow.new_name, AuthFlow.new_chat, AuthFlow.new_owner,
+                     AuthFlow.phone, AuthFlow.code),
+    )
     async def idle_cancel(message: Message, state: FSMContext) -> None:
         if _is_admin(message):
             await _cancel(message, state)
@@ -373,7 +386,7 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
 
 # ---------------------------------------------------------------------------
 def _is_cancel(text: str) -> bool:
-    return text.strip().lower() in {"отмена", "cancel", "stop", "стоп", "/cancel"}
+    return (text or "").strip().lower() in CANCEL_WORDS
 
 
 async def message_or_none(tg: TelegramCore, chat_id: int, text: str) -> None:
