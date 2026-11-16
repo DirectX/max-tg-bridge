@@ -276,7 +276,7 @@ if [ -r "$ENV_FILE" ] && command -v curl >/dev/null 2>&1; then
       ok "/file проксируется ($FILE_CODE, $FILE_CT) — фото из Telegram доступны"
     else
       warn "/file НЕ проксируется ($FILE_CODE, ct=$FILE_CT) — фото из TG скачиваться не будут"
-      hint "Свой Nginx: добавьте location /file (готовый блок в nginx/telegram-api.conf.example)."
+      hint "Свой Nginx: проксируйте и путь /file (готовый конфиг в nginx/telegram-api.conf.example)."
       hint "Сторонний ретранслятор: если он не раздаёт /file, лечится только сменой прокси — текст при этом работает. Подробности: README, раздел 3.1."
     fi
     rm -f "$FILE_BODY"

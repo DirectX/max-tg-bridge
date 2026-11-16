@@ -128,10 +128,10 @@ class TelegramCore:
         /bot  — API-вызовы (sendMessage, getUpdates, getFile);
         /file — скачивание медиа (фото Владельца по пути, полученному от getFile).
 
-        Типовая конфигурация «только /bot»: реверс-прокси настраивают на
-        location /bot, а location /file забывают — тогда getFile отвечает, но
-        download_file по file_path уходит в 404/timeout. Мост это переживает:
-        текст работает, фото честно пропускаются с предупреждением админу.
+        Типовая конфигурация «только API»: реверс-прокси настраивают на путь
+        /bot, а /file забывают — тогда getFile отвечает, но download_file по
+        file_path уходит в 404/timeout. Мост это переживает: текст работает,
+        фото честно пропускаются с предупреждением админу.
         """
         import aiohttp
         base = self.cfg.tg_api_base.rstrip("/")
@@ -407,7 +407,7 @@ class TelegramCore:
                 message.chat.id,
                 "в вашем Telegram-прокси не настроен /file — фото из TG не "
                 "скачиваются, текстовые ответы работают. Как добавить: "
-                "nginx/telegram-api.conf.example (location /file).",
+                "nginx/telegram-api.conf.example (путь /file).",
                 window_s=600)
             return None
         biggest = message.photo[-1]
