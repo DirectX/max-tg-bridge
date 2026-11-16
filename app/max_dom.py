@@ -389,27 +389,70 @@ class MaxWeb:
         if any(part in url for part in ("/login", "/auth", "sign-in")):
             return True
         phone = await self._first(S.PHONE_INPUT, timeout_ms=800, state="attached")
-        return phone is not None
+        if phone is not None:
+            return True
+        # стартовый QR-экран («Войдите в MAX по QR-коду») = сессии нет
+        switch = await self._first(S.PHONE_SWITCH, timeout_ms=800)
+        return switch is not None
 
     # ------------------------------------------------------- шаги логина
     # Используются app/auth_fsm.py (через Telegram) и app/auth.py (CLI).
+    async def _open_phone_form(self) -> bool:
+        """MAX первым делом показывает экран QR-кода («Войдите в MAX по QR-коду»);
+        поле телефона появляется ТОЛЬКО после клика по переключателю
+        «Войти по номеру телефона». Кликаем и ждём форму.
+
+        QR живёт ~2 минуты и протухает («QR-код устарел») — для headless-бота
+        телефонный путь единственный, так что переключаемся всегда, когда
+        поля телефона нет, но переключатель виден.
+        """
+        switch = await self._first(S.PHONE_SWITCH, timeout_ms=6_000)
+        if switch is None:
+            return False
+        try:
+            await switch.click()
+        except (PWError, PWTimeout) as exc:
+            self._log.warning("Клик «Войти по номеру телефона» не вышел: %s", exc)
+            return False
+        await jitter(0.8, 1.6)
+        phone = await self._first(S.PHONE_INPUT, timeout_ms=8_000, state="attached")
+        if phone is None:
+            self._log.warning("Переключатель нажал, но поля телефона нет — "
+                              "проверьте PHONE_INPUT/PHONE_SWITCH по скриншоту")
+            return False
+        self._log.info("Открыл форму ввода телефона (переключатель с QR-экрана)")
+        return True
+
     async def goto_home(self) -> str:
-        """Открывает MAX и определяет состояние: 'logged_in' | 'login_form' | 'unknown'."""
+        """Открывает MAX и определяет состояние: 'logged_in' | 'login_form' | 'unknown'.
+
+        'login_form' возвращается и когда форма была сразу, и когда мы сами
+        переключились с QR-экрана (submit_phone тогда найдёт поле).
+        """
         await self.page.goto(self.cfg.max_url, wait_until="domcontentloaded", timeout=90_000)
         await jitter(2.0, 3.5)
-        phone = await self._first(S.PHONE_INPUT, timeout_ms=6_000, state="attached")
+        phone = await self._first(S.PHONE_INPUT, timeout_ms=3_000, state="attached")
         if phone is not None:
             return "login_form"
-        marker = await self._first(S.LOGGED_IN_MARKERS, timeout_ms=12_000, state="attached")
+        marker = await self._first(S.LOGGED_IN_MARKERS, timeout_ms=3_000, state="attached")
+        if marker is not None:
+            return "logged_in"
+        if await self._open_phone_form():
+            return "login_form"
+        marker = await self._first(S.LOGGED_IN_MARKERS, timeout_ms=10_000, state="attached")
         return "logged_in" if marker is not None else "unknown"
 
     async def submit_phone(self, phone: str) -> tuple[Path, bool]:
         """Вводит номер, жмёт «Далее». Возвращает (скриншот, captcha?)."""
-        phone_input = await self._first(S.PHONE_INPUT, timeout_ms=15_000)
+        phone_input = await self._first(S.PHONE_INPUT, timeout_ms=6_000)
+        if phone_input is None:
+            # страница могла откатиться на QR-экран (перезагрузка/протухание)
+            await self._open_phone_form()
+            phone_input = await self._first(S.PHONE_INPUT, timeout_ms=8_000)
         if phone_input is None:
             shot = await self.screenshot("no_phone_input")
             raise RuntimeError(
-                "Поле ввода телефона не найдено (селекторы PHONE_INPUT) — "
+                "Поле ввода телефона не найдено (селекторы PHONE_INPUT/PHONE_SWITCH) — "
                 f"скриншот: {shot.name}"
             )
         await phone_input.click()

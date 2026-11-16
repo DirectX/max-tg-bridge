@@ -30,6 +30,8 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramRetryAfter,
 )
+from aiogram.enums import ParseMode
+from .format import HTML
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BufferedInputFile, FSInputFile
 
@@ -132,8 +134,19 @@ class TelegramCore:
             pass
 
     # --------------------------------------------------------------- sends
-    async def send_text(self, chat_id: int, text: str,
+    # ---------------------------------------------------- HTML-варианты (v2.2.1)
+    # Панели/статусы/FSM-подсказки ходят ТОЛЬКО через них: parse_mode=HTML
+    # передаётся явно, поэтому «забыли тег → пользователь видит <b>» невозможно.
+    # Фан-аут контента из MAX остаётся flat (send_text/send_photo без parse_mode):
+    # внешний текст может содержать угловые скобки — экранировать его негде и
+    # незачем, плоский режим безопаснее.
+    async def send_html(self, chat_id: int, text: str,
                         reply_to: int | None = None) -> Optional[int]:
+        return await self.send_text(chat_id, text, reply_to, parse_mode=HTML)
+
+    async def send_text(self, chat_id: int, text: str,
+                        reply_to: int | None = None,
+                        parse_mode: str | None = None) -> Optional[int]:
         """Нарезка и отправка текста. None — пользователь недоступен (заблокировал)."""
         last_id: Optional[int] = None
         for chunk in split_text(text):
@@ -141,11 +154,21 @@ class TelegramCore:
                 sent = await self._send_with_retry(
                     self.bot.send_message, chat_id=chat_id, text=chunk,
                     reply_to_message_id=reply_to,
+                    **({"parse_mode": parse_mode} if parse_mode else {}),
                 )
                 last_id = sent.message_id
             except TelegramForbiddenError:
                 log.info("TG %s: пользователь недоступен (заблокировал бота)", chat_id)
                 return None
+            except TelegramBadRequest as exc:
+                # битая разметка в служебном сообщении: не роняем отправку,
+                # уходим в flat (текст важен больше, чем жирный шрифт)
+                log.warning("send_message отклонён (%s) — повторяю без parse_mode", exc)
+                sent = await self._send_with_retry(
+                    self.bot.send_message, chat_id=chat_id, text=chunk,
+                    reply_to_message_id=reply_to,
+                )
+                last_id = sent.message_id
             reply_to = None
         return last_id
 
@@ -196,6 +219,22 @@ class TelegramCore:
             return sent.message_id
         except Exception as exc:  # noqa: BLE001
             log.warning("Файл %s отправить не удалось: %s", filename, exc)
+            return None
+
+    async def notify_admin_html(self, text: str, reply_markup=None) -> Optional[int]:
+        """HTML-уведомление админу (панель/статусы); flat-фолбэк при ошибке."""
+        if not self.cfg.admin_tg_id:
+            log.warning("ADMIN_TG_ID не задан, уведомление потеряно: %s", text)
+            return None
+        try:
+            sent = await self.bot.send_message(self.cfg.admin_tg_id, text,
+                                               parse_mode=HTML, reply_markup=reply_markup)
+            return sent.message_id
+        except TelegramBadRequest as exc:
+            log.warning("HTML-уведомление админу отклонено (%s) — шлю flat", exc)
+            return await self.notify_admin(text, reply_markup)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Уведомление админу не ушло: %s", exc)
             return None
 
     async def notify_admin(self, text: str, reply_markup=None) -> Optional[int]:

@@ -25,13 +25,13 @@ from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from aiogram.utils.markdown import hbold
 
 from ..max_dom import MaxAuthError, MaxChatNotFound
 from ..store import Store
 from ..utils import get_logger, normalize_phone
 from ..config import Config
 from .bot import TelegramCore
+from .format import HTML, bold, code, esc, italic
 from .keyboards import auth_cancel_row, auth_captcha_row, auth_waited_row
 from .states import AuthFlow
 
@@ -82,10 +82,10 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         await state.set_state(AuthFlow.new_name)
         await tg.bot.send_message(
             chat_id,
-            f"{label} <b>Новый аккаунт MAX</b>\n\n"
+            f"{label} {bold('Новый аккаунт MAX')}\n\n"
             "1/3. Как назвать профиль?\n"
-            "  Пример: <i>Школа 5Б</i>\n"
-            f"  {CANCEL_HINT}", parse_mode="HTML")
+            f"  Пример: {italic('Школа 5Б')}\n"
+            f"  {CANCEL_HINT}", parse_mode=HTML)
 
     # ============================================================== RELOGIN
     async def start_relogin(chat_id: int, state: FSMContext, account_id: int) -> str:
@@ -118,9 +118,9 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         await tg.bot.send_message(
             chat_id,
             f"{label} {verb}: браузер открыт, страница входа MAX.\n\n"
-            f"2/3. Отправьте <b>номер телефона</b> аккаунта MAX "
+            f"2/3. Отправьте {bold('номер телефона')} аккаунта MAX "
             f"(формат +79991234567).\n  {CANCEL_HINT}",
-            parse_mode="HTML")
+            parse_mode=HTML)
 
     # --------------------------------------------------------- шаг: ИМЯ (new)
     @router.message(AuthFlow.new_name)
@@ -134,14 +134,14 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             await message.answer("Название слишком короткое. " + CANCEL_HINT)
             return
         if store.get_account_by_name(name):
-            await message.answer(f"Название «{name}» уже занято. Другое?")
+            await message.answer(f"Название {code(name)} уже занято. Другое?")
             return
         await state.update_data(name=name)
         await state.set_state(AuthFlow.new_chat)
         await message.answer(
-            f"2/3. Точное <b>название чата в MAX</b> для этого аккаунта?\n"
+            f"2/3. Точное {bold('название чата в MAX')} для этого аккаунта?\n"
             "  Как в списке чатов / шапке. Можно и прямую ссылку (начинается с http).\n"
-            f"  {CANCEL_HINT}", parse_mode="HTML")
+            f"  {CANCEL_HINT}", parse_mode=HTML)
 
     # ------------------------------------------------------ шаг: ЧАТ (new)
     @router.message(AuthFlow.new_chat)
@@ -158,11 +158,11 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         await state.update_data(chat_title=chat_title, chat_url=chat_url)
         await state.set_state(AuthFlow.new_owner)
         await message.answer(
-            "3/3. <b>Telegram ID Владельца</b> — кому прилетают сообщения и кто "
+            f"3/3. {bold('Telegram ID Владельца')} — кому прилетают сообщения и кто "
             "может отвечать в MAX?\n"
             "  Целое число (свой /id). «минус» нельзя — только личный user id.\n"
             "  Вы — владелец? Отправьте свой id или 'me'.\n"
-            f"  {CANCEL_HINT}", parse_mode="HTML")
+            f"  {CANCEL_HINT}", parse_mode=HTML)
 
     # --------------------------------------------------- шаг: ВЛАДЕЛЕЦ (new)
     @router.message(AuthFlow.new_owner)
@@ -244,9 +244,9 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
                 reply_markup=_kb_with([auth_captcha_row(), auth_cancel_row()]))
         else:
             await message.answer(
-                f"{label} Пришлите <b>код из СМС</b> (цифры).\n"
+                f"{label} Пришлите {bold('код из СМС')} (цифры).\n"
                 "«повторить» — запросить новый код, «отмена» — свернуть.",
-                parse_mode="HTML",
+                parse_mode=HTML,
                 reply_markup=_kb_with([auth_cancel_row()]))
         await state.update_data(phone=phone)
         await state.set_state(AuthFlow.code)
@@ -306,6 +306,8 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
                       *, logged_in_already: bool = False) -> None:
         data = await state.get_data() if state else {}
         account_id = data.get("account_id")
+        _acc0 = store.get_account(account_id) if account_id else None
+        name_hint = _acc0.name if _acc0 else f"#{account_id}"
         if not account_id:
             if state:
                 await state.clear()
@@ -313,9 +315,9 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         try:
             acc = await mgr.auth_finalize(account_id)
         except MaxChatNotFound as exc:
-            await tg.notify_admin(
-                f"⚠️ «{account_id}»: вход есть, но целевой чат не открылся — "
-                f"{exc}\nПроверьте MAX_CHAT_TITLE/URL и селекторы CHAT_ITEM/SEARCH_*."
+            await tg.notify_admin_html(
+                f"⚠️ {bold(name_hint)}: вход есть, но целевой чат не открылся — "
+                f"{esc(exc)}\nПроверьте MAX_CHAT_TITLE/URL и селекторы CHAT_ITEM/SEARCH_*."
             )
             return
         except MaxAuthError as exc:
@@ -327,10 +329,10 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         name = acc.name if acc else f"#{account_id}"
         await tg.bot.send_message(
             chat_id,
-            f"✅ Аккаунт <b>{hbold(name)}</b> авторизован, воркер запущен"
+            f"✅ Аккаунт {bold(name)} авторизован, воркер запущен"
             + (" (сессия уже была живой)." if logged_in_already else ".")
             + "\nНазначьте слушателей: /admin → выберите аккаунт → «Слушатели».",
-            parse_mode="HTML")
+            parse_mode=HTML)
 
     # ------------------------------------------------------------- колбэки
     @router.callback_query(F.data == "auth_vnc")

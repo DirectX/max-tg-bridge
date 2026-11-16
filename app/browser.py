@@ -224,15 +224,28 @@ class AccountBrowser:
             if self._log_fh and not self._log_fh.closed:
                 self._log_fh.write(line + "\n")
 
+        # Телеметрия самого MAX (apptracer — crash/analytics SDK) регулярно
+        # отваливается (ERR_CONNECTION_REFUSED / DNS) и тонет browser.log
+        # шумом, не связанным с работой моста. Гасим известные домены.
+        noisy = (
+            "apptracer.ru", "crashlytics", "google-analytics",
+            "doubleclick", "firebase.googleapis", "firebaselogging",
+            "play.googleapis", "adservice.google",
+        )
+
+        def _quiet(text: str) -> bool:
+            return any(d in text for d in noisy)
+
         page.on(
             "console",
             lambda msg: w(f"[console:{msg.type}] {msg.text}")
-            if msg.type in ("error", "warning") else None,
+            if (msg.type in ("error", "warning") and not _quiet(msg.text)) else None,
         )
         page.on("pageerror", lambda err: w(f"[pageerror] {err}"))
         page.on(
             "requestfailed",
-            lambda req: w(f"[requestfailed] {req.method} {req.url[:160]} -> {req.failure}"),
+            lambda req: None if _quiet(req.url) else w(
+                f"[requestfailed] {req.method} {req.url[:160]} -> {req.failure}"),
         )
         page.on("crash", lambda _p: self._log.error("Страница MAX crashed"))
 

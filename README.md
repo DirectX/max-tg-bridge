@@ -30,6 +30,19 @@
  └──────────────────────────────────────────────────────────────────────┘
 ```
 
+### Что нового в 2.2.1 — фиксы прод-отчёта (рабочая станция + Orange Pi)
+
+| Симптом | Причина / лечение |
+|---|---|
+| `/admin` показывал `<b>Панель управления</b>` скобочками | parse_mode у Bot = None по умолчанию (защита flat-фан-аута от контента MAX), а панели строили HTML и забывали передать parse_mode явно. Новый [`app/tg/format.py`](app/tg/format.py): `bold()/code()/esc()` + явный `HTML` во всех служебных отправках; `_edit_or_send` всегда с разметкой и flat-фолбэком. Фан-аут сообщений MAX остаётся плоским — так правильно |
+| Логин: «Поле ввода телефона не найдено», на скриншоте QR-экран | web.max.ru первым рисует «Войдите в MAX по QR-коду» (QR живёт ~2 минуты), поле телефона — только после клика «Войти по номеру телефона» (`span.content.svelte-13fyxqk`). Новый `PHONE_SWITCH` в selectors + `_open_phone_form()`: `goto_home`/`submit_phone`/`_looks_like_login` сами переключаются с QR-экрана |
+| Шум `apptracer.ru … ERR_CONNECTION_REFUSED` в browser.log | Телеметрия самого MAX (crash/analytics SDK) отваливается — не связана с мостом. Фильтр известных доменов в `browser.py` |
+| Админ с пустой БД видел «вас должен добавить администратор» | `/start` теперь различает супер-админа: «👑 … /admin → ➕ Добавить аккаунт MAX» |
+
+Регрессы покрыты файлом [`tests/test_markup_and_login_flow.py`](tests/test_markup_and_login_flow.py)
+(14 тестов: экранирование инъекций, parse_mode панелей, запрет двойной обёртки
+и старых h*-хелперов, все пути QR→телефон, retry отката на QR-экран).
+
 ### Что нового в 2.2 — бэкапы и автотесты
 
 | Возможность | Как |
@@ -90,7 +103,8 @@ max-tg-bridge/
 │   └── tg/
 │       ├── bot.py           # ProxiedAiohttpSession + транспорт (per-user sends)
 │       ├── states.py        # FSM-состояния (AuthFlow/AdminInput/UserFlow)
-│       ├── keyboards.py     # inline-меню админки
+│       ├── keyboards.py     # inline-меню админки (кнопки — только через btn())
+│       ├── format.py          # v2.2.1: bold/code/esc + явный HTML для панелей
 │       ├── auth_fsm.py      # интерактивный вход MAX через Telegram ★
 │       ├── admin_handlers.py# /admin: аккаунты, слушатели, инвайты, статус системы
 │       └── user_handlers.py # /start inv_<token>, reply/префиксы, заглушки слушателям
@@ -462,6 +476,7 @@ bash tests/run_js_bridge_test.sh
 | [`tests/test_store_and_invites.py`](tests/test_store_and_invites.py) | CRUD аккаунтов/слушателей, каскады, одноразовые/многоразовые/безлимитные инвайты, `expires_at`, отзыв, FK-каскад, миграция v2→v3 без потери данных; **гонка**: 2 и 10 корутин (`asyncio.gather`) по одноразовой ссылке → ровно один успех, `used_count == 1` |
 | [`tests/test_routing_and_roles.py`](tests/test_routing_and_roles.py) | фан-аут Владельцу+Слушателям с **разными** `tg_message_id` в `message_map`; изоляция аккаунтов (А не течёт в Б); дедуп, mine/self-name/эхо-окно; **настоящие хендлеры** из `register()` вызываются моками: reply Владельца уходит в очередь MAX, reply Слушателя блокируется «только чтение», `/admin`/`/backup` от не-админа отклоняются и не трогают диск; порядок регистрации deep_link-/start |
 | [`tests/test_backup.py`](tests/test_backup.py) | консистентность дампа SQLite (включая **нечекпоинутый WAL**), источник не модифицируется; кеш-папки исключены, сессии внутри; симлинки не следуют; openssl round-trip и неверный пароль; ротация; лимит 50 МБ (архив > лимита остаётся на диске); **round-trip**: восстановление БД из архива → роли/дедуп/маппинги целы |
+| [`tests/test_markup_and_login_flow.py`](tests/test_markup_and_login_flow.py) | v2.2.1: экранирование HTML-инъекций, parse_mode всех панелей, запрет двойной обёртки/старых h*-хелперов, полный QR→телефон путь логина |
 | [`tests/test_real_aiogram_registration.py`](tests/test_real_aiogram_registration.py) | **регресс прод-краша 2026-11-16**: регистрация всех трёх роутеров НАСТОЯЩИМ aiogram; статические сканеры запретов (`in_(*args)`, `~State`, `Command\|Command`, `&`-композиция фильтров); семантика idle_cancel через официальный `HandlerObject.check`; освобождение aiohttp-сессии в `TelegramCore.close()` |
 
 Тесты на реальных библиотеках вскрыли два бака продакшн-кода, которые
@@ -592,6 +607,7 @@ openssl x11vnc` — сетевой слой, который падал на кр
 |---|---|
 | 🔴 «требуется авторизация» | /admin → Переавторизовать (или кнопка из уведомления) |
 | чат не открывается после входа | скриншот `auth_a<N>_*` + селекторы `SEARCH_*`, `CHAT_ITEM`, `CHAT_SCOPE` |
+| «Поле ввода телефона не найдено» | бот сам переключается с QR-экрана (`PHONE_SWITCH`); если не вышло — скриншот `auth_a<N>_no_phone_input_*.png` и обновите `PHONE_SWITCH`/`PHONE_INPUT` |
 | дубли/молчание ленты | `seed=` в `browser_a<N>.log`, затем `CHAT_SCOPE`/`MESSAGE_TEXT` |
 | кто-то из слушателей «пропал» | он не нажал /start боту или заблокировал — добавление слушателя предупреждает, но проверить стоит |
 | OOM / SIGBUS Chromium | не уменьшайте `shm_size: '4gb'`; проверьте `docker stats` |

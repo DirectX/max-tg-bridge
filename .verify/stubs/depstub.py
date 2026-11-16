@@ -58,7 +58,13 @@ def _mk(name, **attrs):
 _mk("playwright")
 _mk("playwright.async_api", BrowserContext=PH, Error=PwErr, Page=PH, Playwright=PH,
     async_playwright=lambda: None, TimeoutError=PwErr, Locator=PH)
+class _ParseMode:
+    HTML = "HTML"
+    MARKDOWN = "Markdown"
+    MARKDOWNV2 = "MarkdownV2"
+
 _mk("aiogram", Bot=PH, Dispatcher=PH, Router=PH, F=PH())
+_mk("aiogram.enums", ParseMode=_ParseMode)
 _mk("aiogram.client")
 _mk("aiogram.client.telegram",
     TelegramAPIServer=type("T", (), {"from_base": staticmethod(lambda b: PH())}))

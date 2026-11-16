@@ -27,12 +27,13 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from aiogram.utils.markdown import hcode, hbold
+
 
 from ..store import Store
 from ..utils import get_logger, read_ram_mb, truncate
 from ..config import Config
 from .bot import TelegramCore
+from .format import HTML, bold, code, esc, italic
 from .keyboards import (
     account_actions,
     delete_confirm,
@@ -74,10 +75,21 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         return False
 
     async def _edit_or_send(callback: CallbackQuery, text: str, kb=None) -> None:
+        """Правка/отправка сообщения ПАНЕЛИ. Всегда HTML (v2.2.1): раньше
+        parse_mode не передавался, а по умолчанию он None -> «<b>Панель
+        управления</b>» показывался скобочками. При TelegramBadRequest
+        (битая разметка) деградируем в flat, но сообщение не теряем."""
+        from aiogram.exceptions import TelegramBadRequest
         try:
-            await callback.message.edit_text(text, reply_markup=kb)
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode=HTML)
+        except TelegramBadRequest as exc:
+            log.warning("HTML-правка не прошла (%s) — повторяю без разметки", exc)
+            await callback.message.edit_text(text, reply_markup=kb, parse_mode=None)
         except Exception:  # noqa: BLE001  (message is not modified и пр.)
-            await callback.message.answer(text, reply_markup=kb)
+            try:
+                await callback.message.answer(text, reply_markup=kb, parse_mode=HTML)
+            except Exception:  # noqa: BLE001
+                await callback.message.answer(text, reply_markup=kb, parse_mode=None)
 
     # ================================================================ /admin
     # ОДИН Command c несколькими именами — это и есть «или»: aiogram
@@ -90,10 +102,10 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             return
         accounts = store.list_accounts()
         await message.answer(
-            f"{cfg.tg_ack_prefix} <b>Панель управления</b> "
+            f"{cfg.tg_ack_prefix} {bold('Панель управления')} "
             f"(аккаунтов: {len(accounts)}, в работе: "
             f"{sum(1 for a in accounts if a.status == 'active')})",
-            reply_markup=main_menu(accounts),
+            reply_markup=main_menu(accounts), parse_mode=HTML,
         )
 
     # ------------------------------------------------------------- главное
@@ -104,7 +116,7 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             return
         await state.clear()
         await _edit_or_send(callback,
-                            f"{cfg.tg_ack_prefix} <b>Панель управления</b>",
+                            f"{cfg.tg_ack_prefix} {bold('Панель управления')}",
                             main_menu(store.list_accounts()))
 
     # -------------------------------------------------------------- добавить
@@ -153,19 +165,19 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             await note.edit_text(f"⛔ Бэкап не удался: {res.warning}")
             return
         m = res.manifest
+        profiles = ", ".join(m.get("profiles", [])) or "—"
         text = (
-            f"💾 Бэкап готов: <code>{res.path.name}</code>\n"
+            f"💾 Бэкап готов: {code(res.path.name)}\n"
             f"Размер: {res.human_size()}" + (" (AES-256)" if res.encrypted else "") + "\n"
             f"Аккаунтов: {m.get('accounts_active', 0)} активных из "
             f"{m.get('accounts_total', 0)}, слушателей: {m.get('listeners', 0)}\n"
-            f"Профили: {', '.join(m.get('profiles', [])) or '—'}\n"
-            + (f"📤 Архив отправлен вам документом выше.\n" if res.sent else
-               f"📁 Только на диске: <code>{res.path}</code>\n")
-            + (f"⚠ {res.warning}\n" if res.warning else "")
-            + f"Восстановление: <code>scripts/restore.py {res.path.name}"
-              + (" --password …" if res.encrypted else "") + " --apply</code>"
+            f"Профили: {esc(profiles)}\n"
+            + ("📤 Архив отправлен вам документом выше.\n" if res.sent else
+               f"📁 Только на диске: {code(res.path)}\n")
+            + (f"⚠ {esc(res.warning)}\n" if res.warning else "")
+            + f"Восстановление: {code('scripts/restore.py ' + res.path.name + (' --password …' if res.encrypted else '') + ' --apply')}"
         )
-        await note.edit_text(text, parse_mode="HTML")
+        await note.edit_text(text, parse_mode=HTML)
 
 
     # -------------------------------------------------------------- аккаунт
@@ -226,9 +238,9 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             return
         await _edit_or_send(
             callback,
-            f"⚠️ Удалить аккаунт <b>{hbold(acc.name)}</b>?\n"
+            f"⚠️ Удалить аккаунт {bold(acc.name)}?\n"
             "Воркер будет остановлен, запись и маппинги — стёрты.\n"
-            f"Профиль браузера переедет в {hcode(str(cfg.trash_root))}/ "
+            f"Профиль браузера переедет в {code(str(cfg.trash_root))}/ "
             "(ручное удаление, откат возможен).",
             delete_confirm(acc))
 
@@ -253,8 +265,8 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         await state.set_state(AdminInput.set_owner)
         await state.update_data(account_id=account_id)
         await callback.message.answer(
-            f"Новый Владелец для «{acc.name}»?\n"
-            f"Сейчас: {hcode(str(acc.owner_tg_id or '—'))}\n"
+            f"Новый Владелец для {bold(acc.name)}?\n"
+            f"Сейчас: {code(acc.owner_tg_id or '—')}\n"
             "Пришлите числовой Telegram id (или 'me'). 'отмена' — оставить как было.")
 
     @router.message(AdminInput.set_owner)
@@ -279,7 +291,8 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             await message.answer("Аккаунт не найден.")
             return
         store.update_account(account_id, owner_tg_id=owner_id)
-        await message.answer(f"✅ Владелец «{acc.name}» → {owner_id}.")
+        await message.answer(f"✅ Владелец {bold(acc.name)} → {code(owner_id)}.",
+                             parse_mode=HTML)
         try:
             await tg.bot.send_message(
                 owner_id,
@@ -311,7 +324,7 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             name = r["full_name"] or r["alias"]
             uname = f" (@{r['username']})" if r["username"] else ""
             who = f"{name}{uname}" if name else "имя неизвестно"
-            lines.append(f"  • {who} [{hcode(str(uid))}]")
+            lines.append(f"  • {esc(who)} [{code(uid)}]")
         return "\n".join(lines)
 
     @router.callback_query(F.data.startswith("lis:"))
@@ -324,7 +337,7 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         acc = store.get_account(account_id)
         if acc is None:
             return
-        text = (f"👥 Слушатели «{hbold(acc.name)}» (только чтение):\n"
+        text = (f"👥 Слушатели {bold(acc.name)} (только чтение):\n"
                 f"{_listener_listing(account_id)}\n\n"
                 "Слушатели получают копию всех входящих из MAX, но отвечать не могут.\n"
                 "Быстрее подключать людей — инвайт-ссылкой (🔗 в меню аккаунта).")
@@ -341,8 +354,9 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         await state.update_data(account_id=account_id)
         await callback.message.answer(
             "Кого добавить в слушатели?\n"
-            "Формат: <code>123456789 Папа Маши</code> (id + опциональный алиас),\n"
-            "или 'me' — добавить себя.\n'отмена' — назад.")
+            f"Формат: {code('123456789 Папа Маши')} (id + опциональный алиас),\n"
+            "или 'me' — добавить себя.\n'отмена' — назад.",
+            parse_mode=HTML)
 
     @router.message(AdminInput.add_listener)
     async def msg_add_listener(message: Message, state: FSMContext) -> None:
@@ -373,8 +387,9 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             return
         added = store.add_listener(account_id, uid, alias)
         await message.answer(
-            f"✅ Слушатель {uid} добавлен к «{acc.name}»."
-            if added else f"Слушатель {uid} уже был в списке.")
+            f"✅ Слушатель {code(uid)} добавлен к {bold(acc.name)}."
+            if added else f"Слушатель {code(uid)} уже был в списке.",
+            parse_mode=HTML)
         try:
             await tg.bot.send_message(
                 uid,
@@ -407,7 +422,7 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             await _edit_or_send(
                 callback,
                 ("✅ Слушатель отключён.\n\n" if removed else "Не найдён.\n\n")
-                + f"👥 Слушатели «{hbold(acc.name)}»:\n{_listener_listing(account_id)}",
+                + f"👥 Слушатели {bold(acc.name)}:\n{_listener_listing(account_id)}",
                 listeners_panel(account_id, _listener_pairs(account_id)))
 
     # ================================================== v2.1 инвайт-ссылки
@@ -463,16 +478,17 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         if link:
             await callback.message.answer(
                 f"🔗 Ссылка готова (роль: {role_ru}, {limit_ru}, действует до "
-                f"{exp_ru}):\n\n<code>{link}</code>\n\n"
+                f"{exp_ru}):\n\n{code(link)}\n\n"
                 "Перешлите её человеку в Telegram. Он откроет чат с ботом и нажмёт "
                 "«Запустить» — привязка произойдёт автоматически, его id искать не нужно.",
-                parse_mode="HTML")
+                parse_mode=HTML)
         else:
             # у бота нет username — остаётся ручной путь /start inv_<token>
             await callback.message.answer(
                 f"🔗 Ссылку собрать не удалось: у бота нет @username.\n"
-                f"Токен: <code>{row['token']}</code> — человек может ввести "
-                f"/start inv_{row['token']} вручную.", parse_mode="HTML")
+                f"Токен: {code(row['token'])} — человек может ввести "
+                f"{code('/start inv_' + row['token'])} вручную.",
+                parse_mode=HTML)
 
     @router.callback_query(F.data.startswith("invlist:"))
     async def cb_invlist(callback: CallbackQuery) -> None:
@@ -492,7 +508,7 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
                    if r["expires_at"] else "бессрочно")
             role = "👑" if r["role"] == "owner" else "👀"
             pairs.append((r["id"], f"{role} осталось {left}/{tot} · до {exp}"))
-        text = (f"🎟 Действующие инвайты «{hbold(acc.name)}»:\n"
+        text = (f"🎟 Действующие инвайты {bold(acc.name)}:\n"
                 + ("\n".join(f"  • {p[1]} (id {p[0]})" for p in pairs)
                    or "  (нет активных — создайте через «🔗 Создать инвайт-ссылку»)"))
         await _edit_or_send(callback, text, invites_panel(account_id, pairs))
@@ -537,17 +553,17 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
 def _render_account(acc, store: Store, mgr) -> str:
     snap = next((s for s in mgr.snapshot() if s["id"] == acc.id), None)
     lines = [
-        f"📇 <b>{hbold(acc.name)}</b> (id={acc.id})",
+        f"📇 {bold(acc.name)} (id={acc.id})",
         f"Статус: {STATUS_LINE.get(acc.status, acc.status)}"
         + (" · 🔑 идёт вход" if snap and snap["auth"] else ""),
-        f"Чат MAX: {truncate(acc.max_chat_title or acc.max_chat_url or '—', 60)}",
-        f"Владелец: {hcode(str(acc.owner_tg_id or '—'))} · "
+        f"Чат MAX: {esc(truncate(acc.max_chat_title or acc.max_chat_url or '—', 60))}",
+        f"Владелец: {code(acc.owner_tg_id or '—')} · "
         f"Слушателей: {len(store.list_listeners(acc.id))}",
     ]
     if acc.phone:
-        lines.append(f"Телефон: {hcode(acc.phone)}")
+        lines.append(f"Телефон: {code(acc.phone)}")
     if acc.max_self_name:
-        lines.append(f"Ник MAX (анти-эхо): {truncate(acc.max_self_name, 40)}")
+        lines.append(f"Ник MAX (анти-эхо): {esc(truncate(acc.max_self_name, 40))}")
     if snap:
         if snap["stats"]:
             lines.append(f"Живо: {snap['stats']}")
@@ -565,7 +581,7 @@ def _render_system(cfg: Config, store: Store, mgr) -> str:
     snap = mgr.snapshot()
     active = sum(1 for s in snap if s["status"] == "active")
     lines = [
-        f"⚙️ <b>Система</b> · аптайм {mgr.uptime_str()}",
+        f"⚙️ {bold('Система')} · аптайм {esc(mgr.uptime_str())}",
         f"RAM: {used or '?'} МБ" + (f" / {limit} МБ" if limit else "") +
         f" · браузеров: {len(mgr.running_ids())}",
         f"Аккаунтов: {len(snap)} (активных {active})",
