@@ -20,8 +20,11 @@ v2 отличия от v1:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +37,10 @@ from .config import Config
 from .utils import get_logger, human_pause, jitter, normalize_ws
 
 log = get_logger("max.dom")
+
+# Сколько секунд ждём активации кнопки «Продолжить» после ввода номера
+# (в реальном DOM она стартует с disabled). Наружу вынесено ради тестов.
+SUBMIT_ENABLE_WAIT_S = 12.0
 
 
 class MaxAuthError(RuntimeError):
@@ -385,15 +392,16 @@ class MaxWeb:
         return False
 
     async def _looks_like_login(self) -> bool:
+        """Любой экран аутентификации (QR или форма телефона) = сессии нет.
+        Якоря form.auth / auth--phone / authLogo надёжнее поиска по полю:
+        ловим и «мы уже на шаге номера», и «откатились на QR»."""
         url = await self.current_url()
         if any(part in url for part in ("/login", "/auth", "sign-in")):
             return True
-        phone = await self._first(S.PHONE_INPUT, timeout_ms=800, state="attached")
-        if phone is not None:
-            return True
-        # стартовый QR-экран («Войдите в MAX по QR-коду») = сессии нет
-        switch = await self._first(S.PHONE_SWITCH, timeout_ms=800)
-        return switch is not None
+        for group in (S.AUTH_SCREEN, S.PHONE_FORM, S.PHONE_SWITCH):
+            if await self._first(group, timeout_ms=800) is not None:
+                return True
+        return False
 
     # ------------------------------------------------------- шаги логина
     # Используются app/auth_fsm.py (через Telegram) и app/auth.py (CLI).
@@ -415,10 +423,11 @@ class MaxWeb:
             self._log.warning("Клик «Войти по номеру телефона» не вышел: %s", exc)
             return False
         await jitter(0.8, 1.6)
+        form = await self._first(S.PHONE_FORM, timeout_ms=6_000)
         phone = await self._first(S.PHONE_INPUT, timeout_ms=8_000, state="attached")
-        if phone is None:
-            self._log.warning("Переключатель нажал, но поля телефона нет — "
-                              "проверьте PHONE_INPUT/PHONE_SWITCH по скриншоту")
+        if form is None and phone is None:
+            self._log.warning("Переключатель нажал, но формы телефона нет — "
+                              "проверьте PHONE_FORM/PHONE_INPUT/PHONE_SWITCH по скриншоту")
             return False
         self._log.info("Открыл форму ввода телефона (переключатель с QR-экрана)")
         return True
@@ -431,19 +440,66 @@ class MaxWeb:
         """
         await self.page.goto(self.cfg.max_url, wait_until="domcontentloaded", timeout=90_000)
         await jitter(2.0, 3.5)
-        phone = await self._first(S.PHONE_INPUT, timeout_ms=3_000, state="attached")
-        if phone is not None:
+        # уже на форме телефона?
+        if await self._first(S.PHONE_FORM, timeout_ms=2_500) is not None \
+                or await self._first(S.PHONE_INPUT, timeout_ms=1_500, state="attached") is not None:
             return "login_form"
-        marker = await self._first(S.LOGGED_IN_MARKERS, timeout_ms=3_000, state="attached")
-        if marker is not None:
+        # уже авторизованы (композер/лента)?
+        if await self._first(S.LOGGED_IN_MARKERS, timeout_ms=3_000, state="attached") is not None:
             return "logged_in"
+        # QR-экран -> переключаемся на телефон
         if await self._open_phone_form():
             return "login_form"
-        marker = await self._first(S.LOGGED_IN_MARKERS, timeout_ms=10_000, state="attached")
-        return "logged_in" if marker is not None else "unknown"
+        # финальная проверка: вдруг просто долго грузился
+        if await self._first(S.LOGGED_IN_MARKERS, timeout_ms=10_000, state="attached") is not None:
+            return "logged_in"
+        return "unknown"
+
+    async def _country_prefix(self) -> str:
+        """Код страны, показанный кнопкой «+7» (префикс живёт НЕ в поле, а в
+        отдельной кнопке страны). Пустая строка — не прочиталось."""
+        for sel in _css_only(S.COUNTRY_BUTTON):
+            try:
+                el = self.page.locator(sel).first
+                if await el.count() == 0:
+                    continue
+                txt = await el.inner_text()
+                m = re.search(r"\+\s?(\d{1,3})", txt or "")
+                if m:
+                    return m.group(1)
+            except (PWError, PWTimeout):
+                continue
+        return ""
 
     async def submit_phone(self, phone: str) -> tuple[Path, bool]:
-        """Вводит номер, жмёт «Далее». Возвращает (скриншот, captcha?)."""
+        """Вводит номер и жмёт «Продолжить». Возвращает (скриншот, captcha?).
+
+        Реальный DOM (form.auth--phone): код страны (+7) — отдельная кнопка
+        `button.country`, а в поле `input[inputmode=decimal]` печатаются
+        ТОЛЬКО 10 цифр абонента. Кнопка «Продолжить» в исходном состоянии
+        имеет атрибут disabled и класс button--disabled — становится активной,
+        когда поле приняло достаточно цифр. Поэтому:
+          1) разбираем номер в национальную часть;
+          2) сверяем код страны на кнопке с кодом номера (иначе честно
+             ругаемся: для другого кода нужно выбрать страну по флагу);
+          3) печатаем посимвольно только цифры;
+          4) ждём enabled у кнопки (своим циклом, не 30-секундным авто-веем).
+        """
+        digits = re.sub(r"\D", "", phone or "")
+        if len(digits) == 11 and digits[0] in "78":
+            national = digits[1:]
+            cc = "7"
+        elif len(digits) == 10:
+            national, cc = digits, "7"
+        elif len(digits) >= 11:
+            national, cc = digits[-10:], digits[: len(digits) - 10]
+        else:
+            shot = await self.screenshot("bad_phone")
+            raise RuntimeError(
+                f"Не понимаю номер {phone!r} (цифр: {len(digits)}) — "
+                f"нужно 10–11 цифр. Скриншот: {shot.name}"
+            )
+
         phone_input = await self._first(S.PHONE_INPUT, timeout_ms=6_000)
         if phone_input is None:
             # страница могла откатиться на QR-экран (перезагрузка/протухание)
@@ -452,16 +508,57 @@ class MaxWeb:
         if phone_input is None:
             shot = await self.screenshot("no_phone_input")
             raise RuntimeError(
-                "Поле ввода телефона не найдено (селекторы PHONE_INPUT/PHONE_SWITCH) — "
-                f"скриншот: {shot.name}"
+                "Поле ввода телефона не найдено (см. PHONE_INPUT/PHONE_SWITCH "
+                f"в selectors.py) — скриншот: {shot.name}"
             )
+
+        # код страны на форме должен совпадать с кодом номера (+7 по умолчанию)
+        shown_cc = await self._country_prefix()
+        if shown_cc and cc and shown_cc != cc.lstrip("0"):
+            shot = await self.screenshot("country_mismatch")
+            raise RuntimeError(
+                f"На форме выбран код +{shown_cc}, а номер {phone} — с кодом "
+                f"+{cc}. Выберите страну в браузере (кнопка с флагом) или "
+                f"укажите номер +{shown_cc}…. Скриншот: {shot.name}"
+            )
+
         await phone_input.click()
-        await phone_input.fill("")
-        await phone_input.press_sequentially(phone, delay=110)
+        await jitter(0.25, 0.6)
+        # чистим поле «по-человечески» (fill() на Svelte-контролируемых инпутах
+        # иногда не доносит событие изменения)
+        await self.page.keyboard.press("Control+A")
+        await jitter(0.08, 0.2)
+        await self.page.keyboard.press("Delete")
+        await jitter(0.15, 0.4)
+        await phone_input.press_sequentially(national, delay=120)
         await jitter(0.6, 1.4)
 
         submit = await self._first(S.PHONE_SUBMIT_BUTTON, timeout_ms=5_000)
         if submit is not None:
+            # кнопка стартует disabled; ждём активности своим циклом, чтобы не
+            # висеть 30 с на авто-вее и дать внятную диагностику
+            enabled = False
+            deadline = time.monotonic() + SUBMIT_ENABLE_WAIT_S
+            while time.monotonic() < deadline:
+                try:
+                    if await submit.is_enabled():
+                        enabled = True
+                        break
+                except (PWError, PWTimeout):
+                    break
+                await asyncio.sleep(0.3)
+            if not enabled:
+                val = ""
+                try:
+                    val = await phone_input.input_value()
+                except (PWError, PWTimeout):
+                    pass
+                shot = await self.screenshot("submit_disabled")
+                raise RuntimeError(
+                    "Кнопка «Продолжить» осталась неактивной — MAX не принял "
+                    f"номер (в поле: {val!r}). Проверьте скриншот {shot.name}: "
+                    "код страны, длина номера, не появилась ли подсказка."
+                )
             await submit.click()
         else:
             await self.page.keyboard.press("Enter")

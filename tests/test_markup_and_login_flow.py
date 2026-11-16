@@ -158,34 +158,89 @@ class TestQrSwitchLoginFlow:
         mw = self._mk(cfg, monkeypatch, phone_visible=False, switch_visible=False)
         assert asyncio.run(mw.goto_home()) == "unknown"
 
-    def test_submit_phone_retries_switch(self, cfg, monkeypatch):
-        """Страница откатилась на QR к моменту ввода телефона — submit_phone
-        сам переключается и находит поле (не падает)."""
+    @staticmethod
+    def _phone_page(cfg, monkeypatch, *, country="7", enabled=True,
+                    form_after_switch=False, typed=None):
+        """Фейк страницы с формой form.auth--phone как в реальном DOM MAX."""
         from app.max_dom import AccountTarget, MaxWeb
         tgt = AccountTarget(account_id=1, chat_title="9 Б", tmp_dir=cfg.tmp_dir)
         page = MagicMock()
         page.evaluate = AsyncMock(return_value="https://web.max.ru/")
+        page.goto = AsyncMock()
         page.screenshot = AsyncMock(return_value=b"png")
         page.keyboard = SimpleNamespace(type=AsyncMock(), press=AsyncMock())
         mw = MaxWeb(page, cfg, tgt)
-        box = {"phone": False}
+
+        box = {"phone": False, "typed": typed if typed is not None else ""}
+
+        class FakeInput:
+            async def click(self): pass
+            async def fill(self, v): box["typed"] = v
+            async def press_sequentially(self, text, delay=0):
+                box["typed"] += text
+            async def is_enabled(self): return enabled
+            async def input_value(self): return box["typed"]
+
+        class FakeBtn:
+            async def click(self):
+                if form_after_switch:
+                    box["phone"] = True
+
+            async def is_enabled(self):
+                return enabled
 
         async def fake_first(candidates, root=None, timeout_ms=5_000, state="visible"):
             for sel in candidates:
-                if sel in S.PHONE_INPUT and box["phone"]:
-                    return SimpleNamespace(click=AsyncMock(), fill=AsyncMock(),
-                                           press_sequentially=AsyncMock())
-                if sel in S.PHONE_SWITCH and not box["phone"]:
-                    return SimpleNamespace(
-                        click=AsyncMock(side_effect=lambda: box.__setitem__("phone", True)))
+                if sel in S.PHONE_INPUT and (box["phone"] or not form_after_switch):
+                    return FakeInput()
+                if sel in S.PHONE_FORM and (box["phone"] or not form_after_switch):
+                    return FakeBtn()
+                if sel in S.PHONE_SWITCH and form_after_switch and not box["phone"]:
+                    return FakeBtn()
                 if sel in S.PHONE_SUBMIT_BUTTON:
-                    return SimpleNamespace(click=AsyncMock())
+                    return FakeBtn()
             return None
         monkeypatch.setattr(mw, "_first", fake_first)
+        monkeypatch.setattr(mw, "_country_prefix", AsyncMock(return_value=country))
         monkeypatch.setattr(mw, "detect_captcha", AsyncMock(return_value=False))
+        return mw, box
+
+    def test_submit_phone_types_only_national_digits(self, cfg, monkeypatch):
+        """Реальный DOM: «+7» живёт в кнопке страны, в поле — только 10 цифр."""
+        mw, box = self._phone_page(cfg, monkeypatch, country="7")
+        asyncio.run(mw.submit_phone("+7 (999) 123-45-67"))
+        assert box["typed"] == "9991234567", box["typed"]
+
+    def test_submit_phone_accepts_8_prefix(self, cfg, monkeypatch):
+        mw, box = self._phone_page(cfg, monkeypatch, country="7")
+        asyncio.run(mw.submit_phone("8 999 123-45-67"))
+        assert box["typed"] == "9991234567"
+
+    def test_submit_phone_country_mismatch_raises(self, cfg, monkeypatch):
+        mw, box = self._phone_page(cfg, monkeypatch, country="998")
+        with pytest.raises(RuntimeError, match="код"):
+            asyncio.run(mw.submit_phone("+79991234567"))
+
+    def test_submit_phone_waits_and_reports_disabled_submit(self, cfg, monkeypatch):
+        """Кнопка «Продолжить» стартует disabled; если не активировалась —
+        внятная ошибка со скриншотом, а не 30-секундный авто-вей."""
+        import app.max_dom as md
+        monkeypatch.setattr(md, "SUBMIT_ENABLE_WAIT_S", 0.6)   # тест не спит 12 c
+        mw, box = self._phone_page(cfg, monkeypatch, enabled=False)
+        with pytest.raises(RuntimeError, match="Продолжить"):
+            asyncio.run(mw.submit_phone("+79991234567"))
+
+    def test_submit_phone_retries_switch(self, cfg, monkeypatch):
+        """Страница откатилась на QR — submit_phone сам переключается."""
+        mw, box = self._phone_page(cfg, monkeypatch, form_after_switch=True)
         shot, captcha = asyncio.run(mw.submit_phone("+79991234567"))
         assert captcha is False
-        assert box["phone"], "переключение на форму так и не произошло"
+        assert box["typed"] == "9991234567"
+
+    def test_bad_phone_length_raises(self, cfg, monkeypatch):
+        mw, box = self._phone_page(cfg, monkeypatch)
+        with pytest.raises(RuntimeError, match="Не понимаю номер"):
+            asyncio.run(mw.submit_phone("+7123"))
 
     def test_looks_like_login_detects_qr_screen(self, cfg, monkeypatch):
         mw = self._mk(cfg, monkeypatch, phone_visible=False, switch_visible=True)

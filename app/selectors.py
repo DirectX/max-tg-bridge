@@ -75,28 +75,116 @@ PHONE_SWITCH: list[str] = [
     'button:has-text("Телефон")',
 ]
 
-# Поле ввода номера телефона. Приоритет: input[type=tel] -> по плейсхолдеру.
+# ---------------------------------------------------------------------------
+# ФОРМА ТЕЛЕФОНА — по реальному DOM web.max.ru (снят 2026-11-16, Svelte):
+#
+#   <form class="auth auth--phone auth--regular svelte-vywflk">
+#     <div class="field">
+#       <div class="input svelte-1cug6p"><div class="input svelte-1vjsp2y">
+#         <div class="before">
+#           <button class="country" aria-haspopup="dialog">  <-- страна, НЕ инпут!
+#             ... +7 <span class="placeholder">123 456 78 90</span>
+#           </button>
+#         </div>
+#         <input type="text" class="field svelte-1vjsp2y"
+#                autofocus inputmode="decimal" autocomplete="tel">   <-- ВОТ ЭТОТ
+#       </div>
+#     </div>
+#     <button class="button button--large button--primary button--disabled"
+#             disabled type="submit"><span class="content">Продолжить</span></button>
+#     <div class="footer">
+#       <button class="button button--small button--ghost" type="button">
+#         <span class="content">Войти по QR-коду</span></button>   <-- обратный ход
+#     </div>
+#   </form>
+#
+# ОТКУДА БРАЛИСЬ ПРЕДЫДУЩИЕ ПРОВАЛЫ (важно для понимания):
+#   * input[type="tel"] НЕ матчит: у поля type="text" + inputmode="decimal";
+#   * input[placeholder*="…"] НЕ матчит: плейсхолдер — это <span>, не атрибут;
+#   * name="phone" — атрибута нет вообще.
+# Якоря ниже — по реальным атрибутам (autocomplete/inputmode/autofocus) и по
+# форме (form.auth--phone), а не по хэшу svelte-класса (он меняется на сборке).
+
+# Якорь самой формы телефона: самый надёжный признак «мы на шаге номера».
+PHONE_FORM: list[str] = [
+    'form.auth--phone',
+    'form.auth:has(input[autocomplete="tel"])',
+    'form.auth:has(input[inputmode="decimal"])',
+]
+
+# Любой экран аутентификации (QR или телефон) — для _looks_like_login/watchdog.
+AUTH_SCREEN: list[str] = [
+    'form.auth',
+    '[class*="auth--qr"]',
+    '[class*="authLogo"]',
+]
+
+# Поле ввода номера телефона (внимательно: type="text", не "tel"!).
 PHONE_INPUT: list[str] = [
+    'form.auth--phone input[autocomplete="tel"]',
+    'input[autocomplete="tel"]',
+    'form.auth--phone input[inputmode="decimal"]',
+    'input[inputmode="decimal"]',
+    'form.auth--phone input[autofocus]',
+    'input[autofocus]',
+    'div.field > div.input input[type="text"]',
+    'form.auth input[type="text"]',
+    # legacy-догадки v2.0 — на случай возврата классической верстки
     'input[type="tel"]',
     'input[name="phone"]',
     'input[placeholder*="телефон" i]',
     'input[placeholder*="номер" i]',
-    'input[placeholder*="+7"]',
-    'input[placeholder*="999"]',
 ]
 
-# Кнопка «Далее / Получить код» на экране телефона (Playwright-псевдокласс has-text).
+# Кнопка «Продолжить» на экране телефона. Внимательно: в исходном состоянии она
+# имеет класс button--disabled и атрибут disabled — активируется только когда
+# поле приняло достаточное число цифров. Кликать надо с ожиданием enabled
+# (это делает submit_phone), иначе повиснем на 30-секундном авто-вейте.
 PHONE_SUBMIT_BUTTON: list[str] = [
-    'button:has-text("Далее")',
+    'form.auth--phone button[type="submit"]',
+    'form.auth button[type="submit"]',
+    'button.button--primary:has-text("Продолжить")',
     'button:has-text("Продолжить")',
+    'button:has-text("Далее")',
     'button:has-text("Получить код")',
     'button[type="submit"]',
 ]
 
+# Кнопка страны/кода (+7) внутри поля. Трогать НЕ нужно для РФ: префикс уже
+# выбран, а в само поле печатаются ТОЛЬКО 10 цифр абонента (см. submit_phone).
+# Сюда идут только если номер не из списка стран — тогда мост честно ругается.
+COUNTRY_BUTTON: list[str] = [
+    'form.auth--phone button.country',
+    'button.country[aria-haspopup="dialog"]',
+    'div.before button[aria-haspopup="dialog"]',
+]
+
+# QR-экран («Войдите в MAX по QR-коду»): поле телефона появляется только после
+# клика по этому переключателю. Верстка — <span class="content svelte-13fyxqk">
+# Войти по номеру телефона</span>; хэш класса меняться будет, якорь по тексту.
+PHONE_SWITCH: list[str] = [
+    'button:has-text("Войти по номеру телефона")',
+    'a:has-text("Войти по номеру телефона")',
+    '[role="button"]:has-text("номеру телефона")',
+    'span[class*="content"]:has-text("Войти по номеру телефона")',
+    ':text("Войти по номеру телефона")',
+    'button:has-text("по номеру")',
+    'button:has-text("Телефон")',
+]
+
+# Обратный переключатель (с телефонной формы на QR) — «Войти по QR-коду».
+# Нужен, чтобы НЕ путать его с PHONE_SWITCH и понимать, что мы уже на шаге номера.
+QR_SWITCH: list[str] = [
+    'button:has-text("Войти по QR-коду")',
+    'span[class*="content"]:has-text("по QR-коду")',
+]
+
 # Поле / экран ввода кода из SMS. Используется чтобы ДОЖДАТЬСЯ второго шага.
+# NB: inputmode="decimal" у поля ТЕЛЕФОНА, поэтому numeric/one-time-code —
+# безопасные различители шага кода.
 SMS_INPUT: list[str] = [
-    'input[name="code"]',
     'input[autocomplete="one-time-code"]',
+    'input[name="code"]',
     'input[inputmode="numeric"]',
     'input[placeholder*="код" i]',
     'input[type="password"]',
