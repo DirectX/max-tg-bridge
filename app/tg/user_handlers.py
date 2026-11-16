@@ -122,20 +122,27 @@ def register(router: Router, cfg, store, tg, mgr) -> None:
         uid = message.from_user.id if message.from_user else 0
         owned = store.accounts_by_owner(uid)
         listening = store.accounts_by_listener(uid)
-        lines = ["🤖 Мост MAX ⇄ Telegram v2.", f"Ваш user id: `{uid}`"]
+        is_admin = uid != 0 and uid == cfg.admin_tg_id
+        lines = ["🤖 Мост MAX ⇄ Telegram v2.2.", f"Ваш user id: `{uid}`"]
+        if is_admin:
+            lines.append("👑 Вы — СУПЕР-АДМИНИСТРАТОР: панель управления доступна "
+                         "командой /admin (аккаунты, права, инвайты, бэкапы).")
         if owned:
             lines.append("Вы Владелец: " + ", ".join(a.name for a in owned))
         if listening:
             lines.append("Вы слушаете (только чтение): "
                          + ", ".join(a.name for a in listening))
-        if not owned and not listening:
+        if not owned and not listening and not is_admin:
             lines.append("Аккаунтов за вами не закреплено — вас должен добавить "
-                         "администратор.")
-        if owned:
+                         "администратор (или перейдите по инвайт-ссылке от него).")
+        if is_admin and not owned and not listening:
+            lines.append("Пока аккаунтов нет: /admin → ➕ Добавить аккаунт MAX — "
+                         "бот проведёт вас через авторизацию web.max.ru прямо здесь.")
+        if owned or is_admin:
             lines.append(
                 "\nКак отвечать в MAX:\n"
                 "• Reply на присланное из MAX сообщение (текст/фото);\n"
-                f"• или начать строку с префикса {', '.join(cfg.tg_send_prefixes)}."
+                f"• или начало строки с префикса {', '.join(cfg.tg_send_prefixes)}."
             )
         await message.answer("\n".join(lines))
 

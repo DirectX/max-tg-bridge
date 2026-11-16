@@ -387,6 +387,17 @@ class TestInviteActivationHandler:
         assert "Мост MAX" in msg.last_answer
         assert "не закреплено" in msg.last_answer
 
+    def test_admin_start_points_to_panel_not_orphan(self, setup):
+        """Регресс UX-бага: админ с пустой БД видел «вас должен добавить
+        администратор» вместо подсказки про /admin."""
+        msg = FakeMessage(uid=setup.cfg.admin_tg_id, text="/start")
+        asyncio.run(call_callback(setup.router, "cmd_start",
+                                  message=msg, state=FakeState()))
+        ans = msg.last_answer
+        assert "СУПЕР-АДМИНИСТРАТОР" in ans and "/admin" in ans
+        assert "не закреплено" not in ans
+        assert "Добавить аккаунт MAX" in ans
+
     def test_two_users_on_one_time_link(self, setup):
         inv = setup.store.create_invite(setup.acc.id, "listener", max_uses=1)
         self._start(setup, 6001, inv["token"])
