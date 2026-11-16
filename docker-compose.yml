@@ -16,14 +16,12 @@ services:
       context: .
       dockerfile: Dockerfile
     image: max-tg-bridge:2
-    # Архитектура образа. По умолчанию — нативная для Orange Pi (linux/arm64):
-    # пиннинг защищает от случайного запуска amd64 через эмуляцию на плате.
-    #
-    # Сборка/запуск на x86_64-машине (разработка, отладка селекторов):
-    #   BRIDGE_PLATFORM=linux/amd64 docker compose up -d --build
-    # Либо соберите arm64-образ НА x86 через QEMU (для переноса на плату):
-    #   docker run --privileged --rm tonistiigi/binfmt --install arm64
-    platform: ${BRIDGE_PLATFORM:-linux/arm64}
+    # ПУСТО по умолчанию = нативная архитектура хоста: на Orange Pi получится
+    # arm64, на x86-ноутбуке — amd64, без QEMU в обоих случаях. Явное значение
+    # нужно только для КРОСС-сборки (arm64-образ на x86 для переноса на плату):
+    #   BRIDGE_PLATFORM=linux/arm64 docker compose build
+    # (предварительно один раз: docker run --privileged --rm tonistiigi/binfmt --install arm64)
+    platform: ${BRIDGE_PLATFORM:-}
     container_name: max-tg-bridge
 
     env_file:

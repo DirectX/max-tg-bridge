@@ -100,6 +100,8 @@ max-tg-bridge/
 ├── docker-compose.test.yml          # overlay для автотестов (profile: tests)
 ├── nginx/telegram-api.conf.example
 ├── scripts/migrate_v1.py    # миграция данных и профиля с v1
+├── scripts/restore.py       # восстановление из архива бэкапа
+├── scripts/doctor.sh        # диагностика среды (архитектура/rootless/диск)
 ├── scripts/xvfb-start.sh    # Xvfb + x11vnc (ручная капча)
 ├── tests/                   # pytest-набор v2.2 + JS-тест моста чтения (v1)
 │   ├── conftest.py, fakes.py    # изолированные sandbox-фикстуры и фейки TG
@@ -489,7 +491,86 @@ AccountManager (включая переезд профиля в `.trash/`), CRUD
 по одноразовой ссылке** (ровно один успех). Гоняйте после любой правки
 store/bridge/account_manager/tg.
 
-## 13. Селекторы и отладка
+## 13. Сборка: две частые инфраструктурные ошибки (v2.2.1)
+
+Обе не имеют отношения к коду приложения — это среда хоста. Команда диагностики
+(ничего не меняет, только читает):
+
+```bash
+sh scripts/doctor.sh          # + --smoke для пробного mini-build
+```
+
+### «exec /bin/sh: exec format error» (обычно на x86-хосте)
+
+**Причина:** buildx собирает образ **чужой архитектуры** — arm64-бинарники на
+x86-ядре. Типовой сценарий: прежняя версия compose пиннул `platform: linux/arm64`,
+arm64-вариант базового образа осел в кэше под тем же тегом, и последующие сборки
+переиспользуют его (поэтому слой `WORKDIR` показывает `CACHED`, а падает первый
+же `RUN`).
+
+**Лечение (v2.2.1):** платформа в compose теперь **пустая по умолчанию** — берётся
+нативная архитектура хоста (на плате arm64, на ноутбуке amd64):
+
+```bash
+# обычная сборка — нативная арх хоста, без QEMU:
+docker compose up -d --build
+
+# если образ-«инок» уже в кэше:
+docker image rm mcr.microsoft.com/playwright/python:v1.49.0-jammy
+docker compose up -d --build
+
+# кросс-сборка arm64 на x86 (для переноса на плату) — нужен QEMU ОДИН РАЗ:
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+BRIDGE_PLATFORM=linux/arm64 docker compose up -d --build
+```
+
+Проверьте также, что нигде не задана `DOCKER_DEFAULT_PLATFORM=linux/arm64`
+(~/.bashrc, systemd-юниты) — она форсирует платформу поверх compose (doctor.sh
+ловит и это).
+
+### «failed to mount … operation not permitted» (типично на Orange Pi / SBC)
+
+**Причина:** демон Docker работает **rootless** (путь `/home/<user>/.local/share/docker`
+в сообщении об ошибке — верный признак), а монтирование overlay внутри user
+namespace запрещено на многих SBC-ядрах (Rockchip BSP 5.10, старые AppArmor).
+Код образа тут ни при чём — падает даже `WORKDIR`.
+
+**Лечение по убыванию сложности:**
+
+1. **Перейти на rootful-демон (рекомендуется для платы):**
+   ```bash
+   sudo systemctl disable --now docker@$(id -u)   # остановить rootless-сессию
+   sudo systemctl enable --now docker              # системный демон
+   sudo usermod -aG docker $USER                  # перелогин
+   docker info --format '{{.DockerRootDir}}'      # должно стать /var/lib/docker
+   ```
+2. Если нужен rootless — **выключить containerd image store**:
+   `{"features": {"containerd-snapshotter": false}}` в
+   `~/.config/docker/daemon.json`, затем `systemctl --user restart docker`.
+3. Разрешить unprivileged userns (ядро/AppArmor):
+   ```bash
+   sudo sysctl -w kernel.unprivileged_userns_clone=1        # Debian-подобные
+   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0  # Ubuntu 24+
+   # закрепить в /etc/sysctl.d/99-docker.conf
+   ```
+4. `docker compose up -d --build` заново.
+
+### Устранён дополнительный источник отказов сборки
+
+Раньше Dockerfile **обязательно** выполнял `apt-get update && apt-get install
+openssl x11vnc` — сетевой слой, который падал на кривых зеркалах/DNS/прокси
+домашних сетей. Теперь:
+
+* `openssl` **уже есть** в базовом jammy-образе (шифрование бэкапов работает
+  без установки; doctor.sh проверяет это внутри образа);
+* `x11vnc` ставится только по запросу:
+  `docker build --build-arg INSTALL_VNC=1 -t max-tg-bridge:2 .` — он нужен
+  лишь для опции ручной капчи через VNC.
+
+Боевая сборка теперь не требует сети вообще, кроме pip (PyPI) и pull базового
+образа (mcr.microsoft.com).
+
+## 14. Селекторы и отладка
 
 * Все селекторы — в [`app/selectors.py`](app/selectors.py) (как в v1, гайд
   DevTools внутри файла). Логи теперь **на аккаунт**: `data/logs/browser_a<N>.log`,
@@ -509,7 +590,7 @@ store/bridge/account_manager/tg.
 
 Логи: `docker compose logs -f bridge`; пер-аккаунтные: `tail -f data/logs/browser_a2.log`.
 
-## 14. Безопасность
+## 15. Безопасность
 
 * `.env` (токен бота, `ADMIN_TG_ID`, резидуальные телефоны) — `chmod 600`,
   в `.gitignore`, попадает в контейнер только через `env_file`.
@@ -522,7 +603,7 @@ store/bridge/account_manager/tg.
 * Удаление аккаунта не уничтожает профиль сразу — он переезжает в
   `data/profiles/.trash/` (ручная зачистка).
 
-## 15. Известные ограничения
+## 16. Известные ограничения
 
 * Ответы Слушателей не буферизуются «на потом, станет владельцем» — право
   ответа неотчуждаемо от аккаунта.

@@ -38,13 +38,23 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-#--- Системные дополнения ----------------------------------------------------
-# Официальный образ Playwright уже содержит Xvfb и все библиотеки Chromium.
-# openssl  — шифрование архивов бэкапа (AES-256-CBC + PBKDF2), см. app/backup.py;
-# x11vnc   — «глазки» для ручного прохождения капчи/QR (опция).
-RUN apt-get update \
- && apt-get install -y --no-install-recommends openssl x11vnc \
- && rm -rf /var/lib/apt/lists/*
+#--- Системные дополнения (опционально) --------------------------------------
+# НЕ ставим обязательный apt-слой: он требует сети во время сборки и является
+# частым источником отказов (зеркала, DNS, прокси, rootless-режим на SBC).
+#
+#   openssl — УЖЕ есть в базовом jammy-образе (зависимость curl/git/браузеров),
+#             шифрование бэкапов работает без установки;
+#   x11vnc  — нужен ТОЛЬКО для ручной капчи через VNC (README «Авторизация с
+#             глазками»). Ставится по build-аргу, боевая сборка его не тянет.
+#
+# Если VNC нужен:
+#   docker build --build-arg INSTALL_VNC=1 -t max-tg-bridge:2 .
+ARG INSTALL_VNC=0
+RUN if [ "$INSTALL_VNC" = "1" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends x11vnc \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 #--- Код приложения ----------------------------------------------------------
 COPY requirements.txt ./
