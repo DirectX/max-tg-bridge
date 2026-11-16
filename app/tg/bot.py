@@ -28,6 +28,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
+    TelegramNetworkError,
     TelegramRetryAfter,
 )
 from aiogram.enums import ParseMode
@@ -52,18 +53,22 @@ class ProxiedAiohttpSession:
     """Фабрика AiohttpSession, замотанная на TelegramAPIServer.from_base()."""
 
     @staticmethod
-    def create(api_base: str, proxy: str = "") -> Any:
+    def create(api_base: str, proxy: str = "", timeout: float | None = None) -> Any:
         from aiogram.client.session.aiohttp import AiohttpSession
 
         api = TelegramAPIServer.from_base(api_base)
 
         class _Session(AiohttpSession):
             def __init__(self) -> None:
+                # timeout: бюджет на ОДИН запрос по умолчанию (aiogram ставит
+                # DEFAULT_TIMEOUT=60 — на медленном ретрансляторе это 60 с
+                # молчания). Медиа-операции переопределяют его per-call.
+                base = {"timeout": timeout} if timeout else {}
                 for attempt_kwargs in (
-                    {"api": api, "proxy": proxy or None},
-                    {"api": api},
-                    {"proxy": proxy or None} if proxy else {},
-                    {},
+                    {"api": api, "proxy": proxy or None, **base},
+                    {"api": api, **base},
+                    {"proxy": proxy or None, **base} if proxy else base or {},
+                    base or {},
                 ):
                     try:
                         super().__init__(**attempt_kwargs)
@@ -90,7 +95,8 @@ class TelegramCore:
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        session = ProxiedAiohttpSession.create(cfg.tg_api_base, cfg.tg_proxy_url)
+        session = ProxiedAiohttpSession.create(
+            cfg.tg_api_base, cfg.tg_proxy_url, timeout=cfg.tg_timeout_total)
         kwargs: dict[str, Any] = {"session": session}
         if DefaultBotProperties is not None:
             kwargs["default"] = DefaultBotProperties(parse_mode=None)
@@ -102,6 +108,10 @@ class TelegramCore:
         # заполняется в prepare(): нужен для сборки инвайт-deep-link ссылок
         self.bot_username: str | None = None
         self.bot_id: int | None = None
+        # v2.2.1: в прокси может быть настроен только /bot (API-вызовы), но не
+        # /file (скачивание медиа). Тогда текстовые ответы работают, а фото из
+        # Telegram не скачаются. Факт проверяется один раз в prepare().
+        self.file_endpoint_available: bool = True
 
     # ------------------------------------------------------------- lifecycle
     async def prepare(self) -> None:
@@ -110,6 +120,69 @@ class TelegramCore:
         self.bot_id = me.id
         log.info("Telegram: авторизовался @%s через %s (admin=%s)",
                  me.username, self.cfg.tg_api_base, self.cfg.admin_tg_id)
+        await self._probe_endpoints()
+
+    async def _probe_endpoints(self) -> None:
+        """Один раз при старте проверяем ОБА эндпоинта прокси.
+
+        /bot  — API-вызовы (sendMessage, getUpdates, getFile);
+        /file — скачивание медиа (фото Владельца по пути, полученному от getFile).
+
+        Типовая конфигурация «только /bot»: реверс-прокси настраивают на
+        location /bot, а location /file забывают — тогда getFile отвечает, но
+        download_file по file_path уходит в 404/timeout. Мост это переживает:
+        текст работает, фото честно пропускаются с предупреждением админу.
+        """
+        import aiohttp
+        base = self.cfg.tg_api_base.rstrip("/")
+        token = self.cfg.tg_token
+        # ВАЖНО: берём сессию У ЖЕ НАСТРОЕННОГО транспорта, а не новую —
+        # иначе при заданном TG_PROXY_URL проба пойдёт мимо прокси и честно
+        # работающий /file будет объявлен «не настроен».
+        try:
+            sess = await self.bot.session.create_session()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Проба эндпоинтов пропущена (нет сессии: %s)", exc)
+            return
+        try:
+                # /bot — контрольный getMe (дешёвый, уже проходил)
+                async with sess.get(f"{base}/bot{token}/getMe",
+                                    timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        log.error("⛔ Прокси /bot вернул %s — мост работать не будет",
+                                  resp.status)
+                    else:
+                        log.info("✓ Прокси /bot отвечает (%s)", resp.status)
+
+                # /file — GET на заведомо отсутствующем пути. Различаем:
+                #   проксируется  -> api.telegram.org: 404 + JSON {"ok":false}
+                #   не настроен   -> своя 404/502 от Nginx: text/html
+                # Именно GET, а не HEAD: Bot API на HEAD отвечает 405 даже
+                # когда маршрут проксируется нормально (иначе получили бы
+                # ложное «/file не работает» и зря отключили скачивание фото).
+                url = f"{base}/file/bot{token}/probe.test"
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    body = (await resp.text())[:200] if resp.status else ""
+                    looks_like_telegram = "json" in ctype and '"ok"' in body
+                    if resp.status == 200 or looks_like_telegram:
+                        self.file_endpoint_available = True
+                        log.info("✓ Прокси /file отвечает (status=%s, ct=%s) — "
+                                 "скачивание фото из Telegram доступно",
+                                 resp.status, ctype or "?")
+                    else:
+                        self.file_endpoint_available = False
+                        log.warning(
+                            "⚠ Эндпоинт /file НЕ проксирует Telegram API "
+                            "(status=%s, ct=%r, body=%r): фото из Telegram "
+                            "скачиваться не будут. Добавьте в Nginx второй "
+                            "location — см. nginx/telegram-api.conf.example и "
+                            "README §3.1. ТЕКСТОВЫЙ мост при этом работает.",
+                            resp.status, ctype, body[:80])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Проба эндпоинтов не удалась (%s) — продолжаем без "
+                        "диагноза /file", exc)
+        # сессию НЕ закрываем: она принадлежит транспорту (её закроет close())
 
     def invite_link(self, token: str) -> str | None:
         """Deep-link «https://t.me/<bot>?start=inv_<token>» или None, если
@@ -120,7 +193,11 @@ class TelegramCore:
 
     async def run_polling(self) -> None:
         await self.bot.delete_webhook(drop_pending_updates=True)
-        await self.dp.start_polling(self.bot, handle_signals=False)
+        await self.dp.start_polling(
+            self.bot,
+            handle_signals=False,
+            polling_timeout=self.cfg.tg_poll_timeout,
+        )
 
     async def close(self) -> None:
         # ВАЖНО: bot.close() — это НЕ освобождение ресурсов, а метод Telegram
@@ -178,7 +255,8 @@ class TelegramCore:
         caption = truncate(caption or "", MAX_CAPTION)
         try:
             sent = await self._send_with_retry(
-                self.bot.send_photo, chat_id=chat_id,
+                self.bot.send_photo, _timeout=self.cfg.tg_timeout_media,
+                chat_id=chat_id,
                 photo=BufferedInputFile(data, filename=filename),
                 caption=caption or None, reply_to_message_id=reply_to,
             )
@@ -192,6 +270,7 @@ class TelegramCore:
                 sent = await self.bot.send_document(
                     chat_id, BufferedInputFile(data, filename=filename),
                     caption=caption or None, reply_to_message_id=reply_to,
+                    request_timeout=int(self.cfg.tg_timeout_media),
                 )
                 return sent.message_id
             except Exception:  # noqa: BLE001
@@ -201,7 +280,8 @@ class TelegramCore:
     async def send_screenshot(self, chat_id: int, path, caption: str = "") -> Optional[int]:
         try:
             sent = await self._send_with_retry(
-                self.bot.send_photo, chat_id=chat_id,
+                self.bot.send_photo, _timeout=self.cfg.tg_timeout_media,
+                chat_id=chat_id,
                 photo=FSInputFile(str(path)), caption=truncate(caption, MAX_CAPTION) or None,
             )
             return sent.message_id
@@ -212,8 +292,10 @@ class TelegramCore:
     async def send_file_bytes(self, chat_id: int, data: bytes, filename: str,
                               caption: str = "") -> Optional[int]:
         try:
-            sent = await self.bot.send_document(
-                chat_id, BufferedInputFile(data, filename=filename),
+            sent = await self._send_with_retry(
+                self.bot.send_document, _timeout=self.cfg.tg_timeout_media,
+                chat_id=chat_id,
+                document=BufferedInputFile(data, filename=filename),
                 caption=truncate(caption, MAX_CAPTION) or None,
             )
             return sent.message_id
@@ -256,28 +338,49 @@ class TelegramCore:
             pass
 
     # -------------------------------------------------------------- helpers
-    async def _send_with_retry(self, fn, **kwargs):
+    async def _send_with_retry(self, fn, *, _timeout: float | None = None, **kwargs):
+        """Отправка с ретраями. _timeout — бюджет ОДНОЙ попытки (для медиа он
+        длиннее, чем для текстовых запросов): aiogram принимает request_timeout
+        на каждый вызов метода.
+
+        Важно: при таймауте соединения Telegram уже МОГ принять сообщение
+        (запрос ушёл, ответ не дождались) — поэтому повтор для текстовых
+        уведомлений допустим, а для критичных «отправить один раз» операций
+        вызывающий должен это учитывать.
+        """
+        attempts = max(1, self.cfg.tg_send_attempts)
         last_exc: Exception | None = None
-        for attempt in range(4):
+        for attempt in range(attempts):
             try:
+                if _timeout is not None:
+                    return await fn(request_timeout=_timeout, **kwargs)
                 return await fn(**kwargs)
             except TelegramRetryAfter as exc:
                 wait_s = int(exc.retry_after) + 1
                 log.warning("Telegram flood-limit: спим %d c", wait_s)
                 await asyncio.sleep(wait_s)
+                attempts = max(attempts, attempt + 2)   # лимит не считается провалом
             except (TelegramBadRequest, TelegramForbiddenError):
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
-                wait_s = min(2 ** attempt * 2, 30)
-                log.warning("Telegram send упал (%s), попытка %d/4, спим %d c",
-                            exc, attempt + 1, wait_s)
+                if attempt + 1 >= attempts:
+                    break
+                wait_s = min(2 ** attempt * 2, 20)
+                log.warning("Telegram send упал (%s), попытка %d/%d, спим %d c",
+                            exc, attempt + 1, attempts, wait_s)
                 await asyncio.sleep(wait_s)
-        raise RuntimeError(f"Telegram: 4 неудачные попытки: {last_exc}")
+        raise TelegramNetworkError(
+            method=getattr(fn, "__name__", "?"),
+            message=f"нет ответа от {self.cfg.tg_api_base} после {attempts} попыток "
+                    f"(бюджет {(_timeout or self.cfg.tg_timeout_total):.0f} c на попытку): "
+                    f"{last_exc}",
+        )
 
     async def download_bytes(self, file_path: str) -> bytes:
         """Скачивание по file_path через НАШ API-бейс (то есть через прокси)."""
-        stream = await self.bot.download_file(file_path)
+        stream = await self.bot.download_file(
+            file_path, timeout=int(self.cfg.tg_timeout_download))
         buf = io.BytesIO()
         if hasattr(stream, "read"):
             while True:
@@ -297,8 +400,19 @@ class TelegramCore:
     async def extract_photo(self, message: Message) -> tuple[bytes, str] | None:
         if not message.photo:
             return None
+        if not self.file_endpoint_available:
+            # прокси без /file: не пытаемся качать (это 60 с таймаута на ровном
+            # месте), честно объясняем владельцу один раз в 10 минут
+            await self.throttled_ack(
+                message.chat.id,
+                "в вашем Telegram-прокси не настроен /file — фото из TG не "
+                "скачиваются, текстовые ответы работают. Как добавить: "
+                "nginx/telegram-api.conf.example (location /file).",
+                window_s=600)
+            return None
         biggest = message.photo[-1]
-        tg_file = await self.bot.get_file(biggest.file_id)
+        tg_file = await self.bot.get_file(
+            biggest.file_id, request_timeout=int(self.cfg.tg_timeout_total))
         data = await self.download_bytes(tg_file.file_path)
         if not data:
             return None

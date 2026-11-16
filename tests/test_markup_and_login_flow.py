@@ -250,3 +250,47 @@ class TestQrSwitchLoginFlow:
         assert hasattr(S, "PHONE_SWITCH") and S.PHONE_SWITCH
         joined = " ".join(S.PHONE_SWITCH).lower()
         assert "номер" in joined
+
+
+class TestTransportTimings:
+    """v2.2.1: бюджеты таймаутов и проба /bot-vs-/file."""
+
+    def test_defaults_and_clamps(self, tmp_path, monkeypatch):
+        from app.config import load_config
+        env = {
+            "TG_BOT_TOKEN": "1:x", "TG_API_BASE": "https://p.example",
+            "ADMIN_TG_ID": "9",
+            "PROFILES_ROOT": str(tmp_path / "p"), "TRASH_ROOT": str(tmp_path / "t"),
+            "TMP_DIR": str(tmp_path / "tm"), "DB_PATH": str(tmp_path / "s" / "db.db"),
+            "BROWSER_LOG": str(tmp_path / "l" / "b.log"),
+            "SCREENSHOTS_DIR": str(tmp_path / "l"),
+            "BACKUPS_DIR": str(tmp_path / "b"),
+            # намеренно невалидные: total меньше long-poll, media меньше 30
+            "TG_TIMEOUT_TOTAL": "5", "TG_TIMEOUT_MEDIA": "10",
+        }
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        cfg = load_config()
+        assert cfg.tg_timeout_total >= cfg.tg_poll_timeout + 10  # кламп поднимет
+        assert cfg.tg_timeout_media >= 30
+        assert cfg.tg_send_attempts >= 1
+
+    def test_session_gets_timeout(self, cfg):
+        from app.tg.bot import ProxiedAiohttpSession
+        s = ProxiedAiohttpSession.create(cfg.tg_api_base, "", timeout=cfg.tg_timeout_total)
+        assert float(s.timeout) == float(cfg.tg_timeout_total)
+
+    def test_probe_reuses_transport_session(self):
+        """Проба /file обязана идти через сессию транспорта (с TG_PROXY_URL),
+        иначе она ходит мимо прокси и ложно reportит «/file не работает»."""
+        import inspect
+        from app.tg import bot as botmod
+        s = inspect.getsource(botmod.TelegramCore._probe_endpoints)
+        assert "self.bot.session.create_session()" in s
+        assert "aiohttp.ClientSession()" not in s
+
+    def test_extract_photo_respects_flag(self):
+        import inspect
+        from app.tg import bot as botmod
+        s = inspect.getsource(botmod.TelegramCore.extract_photo)
+        assert "file_endpoint_available" in s

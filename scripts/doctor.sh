@@ -27,6 +27,12 @@ bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; PROBLEMS=$((PROBLEMS + 1)); }
 hint() { HINTS="$HINTS
   • $*"; }
 
+# читает KEY=... из dotenv-файла: без кавычек, без CR, без строок-комментариев
+_envval() {
+  sed -n "s/^[[:space:]]*$1=//p" "$2" 2>/dev/null | tail -1 \
+    | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
+}
+
 command -v docker >/dev/null 2>&1 || { bad "docker не найден в PATH"; say "$HINTS"; exit 1; }
 
 # ------------------------------------------------------------------ базовое
@@ -228,6 +234,58 @@ if docker image inspect "$TAG" >/dev/null 2>&1; then
   fi
 else
   say "  пропущено: базовый образ не скачан"
+fi
+
+# ------------------------------------------------- Telegram-прокси: /bot vs /file
+hdr "Telegram-прокси: эндпоинты /bot и /file"
+# Мост пользуется ДВУМЯ путями:
+#   /bot<token>/<method>     — все вызовы API (sendMessage/getUpdates/getFile)
+#                              и ЗАГРУЗКА файлов (скриншоты, бэкапы)
+#   /file/bot<token>/<path>  — СКАЧИВАНИЕ того, что прислали вам (фото Владельца)
+# Классическая дыра: проксируют только /bot. Тогда текст ходит в обе стороны,
+# скриншоты админа доезжают, а фото из Telegram теряются молча. v2.2.1 сам
+# обнаруживает это при старте контейнера; здесь проверяем с хоста.
+ENV_FILE="${ENV_FILE:-.env}"
+if [ -r "$ENV_FILE" ] && command -v curl >/dev/null 2>&1; then
+  BASE=$(_envval TG_API_BASE "$ENV_FILE")
+  TOK=$(_envval TG_BOT_TOKEN "$ENV_FILE")
+  case "$BASE" in
+    http://*) bad "TG_API_BASE начинается с http:// — Bot API требует HTTPS"
+              hint "Прокси обязан быть по https, иначе Telegram отклонит запросы." ;;
+  esac
+  if [ -n "$BASE" ] && [ -n "$TOK" ]; then
+    say "  прокси: $BASE (token $(printf '%s' "$TOK" | cut -c1-6)…)"
+
+    BOT_BODY=/tmp/doctor_bot.$$.json
+    BOT_TIMING=$(curl -s -o "$BOT_BODY" -w '%{http_code}/%{time_total}s' \
+                 --max-time 15 "$BASE/bot$TOK/getMe" 2>/dev/null)
+    if [ -s "$BOT_BODY" ] && grep -q '"ok":true' "$BOT_BODY" 2>/dev/null; then
+      ok "/bot отвечает ($BOT_TIMING) — API доступен"
+    else
+      bad "/bot не отвечает как Telegram API ($BOT_TIMING)"
+      hint "Без /bot мост не работает вовсе. Проверьте с хоста: curl -v $BASE/bot<token>/getMe"
+    fi
+    rm -f "$BOT_BODY"
+
+    FILE_BODY=/tmp/doctor_file.$$.txt
+    FILE_META=$(curl -s -o "$FILE_BODY" -w '%{http_code}|%{content_type}' \
+                 --max-time 15 "$BASE/file/bot$TOK/probe.test" 2>/dev/null)
+    FILE_CODE=${FILE_META%%|*}
+    FILE_CT=${FILE_META#*|}
+    if [ "$FILE_CODE" = "200" ] || printf '%s' "$FILE_CT" | grep -q json; then
+      ok "/file проксируется ($FILE_CODE, $FILE_CT) — фото из Telegram доступны"
+    else
+      warn "/file НЕ проксируется ($FILE_CODE, ct=$FILE_CT) — фото из TG скачиваться не будут"
+      hint "Свой Nginx: добавьте location /file (готовый блок в nginx/telegram-api.conf.example)."
+      hint "Сторонний ретранслятор: если он не раздаёт /file, лечится только сменой прокси — текст при этом работает. Подробности: README, раздел 3.1."
+    fi
+    rm -f "$FILE_BODY"
+  else
+    say "  пропущено: TG_API_BASE / TG_BOT_TOKEN не прочитаны из $ENV_FILE"
+  fi
+else
+  say "  пропущено: нет $ENV_FILE или curl — проверка есть в логе старта контейнера"
+  say "  («Прокси /bot отвечает» / «Эндпоинт /file НЕ проксирует Telegram API»)"
 fi
 
 # ---------------------------------------------------------------------- smoke

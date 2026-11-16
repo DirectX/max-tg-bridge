@@ -129,6 +129,28 @@ class Config:
     # Авторизационная сессия без активности админа — авто-отмена
     auth_idle_timeout: float = 15 * 60.0
 
+    # ------------------- v2.2.1 тайминги Telegram-транспорта ---------------
+    # Дефолт aiogram (total=60 c) на медленном/нестабильном ретрансляторе
+    # превращал любую задержку в 60 с полного молчания бота, а 4 ретрая —
+    # в 4 минуты. Разделяем бюджет по типу операции:
+    #   * обычные запросы (sendMessage, getMe, …) — короткий total: они
+    #     kilobyte-ные, 60 с ждать нечего, fail-fast + явная ошибка админу;
+    #   * медиа (загрузка фото/документа в TG) — длинный: скриншот или бэкап
+    #     это мегабайты, и на 30 КБ/с они едут минуты;
+    #   * скачивание файлов из TG — тоже длинный бюджет.
+    # polling: aiogram сам ставит request_timeout = session.timeout +
+    # polling_timeout (см. dispatcher._listen_updates), поэтому long-poll
+    # не умирает от короткого session-timeout.
+    tg_timeout_total: float = 20.0     # обычные запросы (fail-fast)
+    tg_timeout_media: float = 180.0    # send_photo/send_document (upload)
+    tg_timeout_download: float = 180.0  # download_file
+    tg_send_attempts: int = 3          # попыток на одну отправку в TG
+    tg_poll_timeout: int = 10          # long-poll getUpdates, сек
+    # Скриншоты страницы MAX: JPEG вместо PNG (1440x900 PNG ~1.5-2 МБ против
+    # 120-250 КБ JPEG) — меньше байт, летящих через медленный прокси.
+    shot_jpeg: bool = True
+    shot_quality: int = 55
+
     # ----------------------------- v2.2 бэкапы ----------------------------
     backups_dir: Path = field(default_factory=lambda: Path("/data/backups"))
     backup_hour: int = 4                  # суточная копия в 04:00 (после релоадов)
@@ -193,6 +215,13 @@ class Config:
             poll_interval=_float("MAX_POLL_INTERVAL", 0.7),
             keepalive_interval=_float("MAX_KEEPALIVE_INTERVAL", 90.0),
             auth_idle_timeout=_float("AUTH_IDLE_TIMEOUT", 900.0),
+            tg_timeout_total=_float("TG_TIMEOUT_TOTAL", 20.0),
+            tg_timeout_media=_float("TG_TIMEOUT_MEDIA", 180.0),
+            tg_timeout_download=_float("TG_TIMEOUT_DOWNLOAD", 180.0),
+            tg_send_attempts=_int("TG_SEND_ATTEMPTS", 3),
+            tg_poll_timeout=_int("TG_POLL_TIMEOUT", 10),
+            shot_jpeg=_bool("SHOT_JPEG", True),
+            shot_quality=_int("SHOT_QUALITY", 55),
             backups_dir=Path(_opt("BACKUPS_DIR", "/data/backups")),
             backup_hour=_int("BACKUP_HOUR", 4),
             backup_keep=_int("BACKUP_KEEP", 7),
@@ -200,6 +229,25 @@ class Config:
             backup_send_max_mb=_int("BACKUP_SEND_MAX_MB", 50),
             backup_include_trash=_bool("BACKUP_INCLUDE_TRASH", False),
         )
+        # long-poll держит соединение polling_timeout секунд без ответа:
+        # session-timeout обязан быть больше, иначе getUpdates будет
+        # ложно валиться на каждом цикле (aiogram прибавляет их сам).
+        if cfg.tg_timeout_total <= cfg.tg_poll_timeout + 5:
+            fixed = cfg.tg_poll_timeout + 10
+            print(f"[config] TG_TIMEOUT_TOTAL={cfg.tg_timeout_total} не покрывает "
+                  f"long-poll ({cfg.tg_poll_timeout} c) — поднял до {fixed}")
+            cfg.tg_timeout_total = fixed
+        for name in ("tg_timeout_media", "tg_timeout_download"):
+            val = getattr(cfg, name)
+            if val < 30:
+                print(f"[config] {name.upper()}={val} слишком мало для медиа — 30")
+                setattr(cfg, name, 30.0)
+        if cfg.tg_send_attempts < 1:
+            cfg.tg_send_attempts = 1
+        if not 10 <= cfg.shot_quality <= 95:
+            print(f"[config] SHOT_QUALITY={cfg.shot_quality} вне разумного диапазона — 55")
+            cfg.shot_quality = 55
+
         if cfg.backup_send_max_mb > TG_SEND_HARD_LIMIT_MB:
             print(f"[config] BACKUP_SEND_MAX_MB={cfg.backup_send_max_mb} урезан до "
                   f"{TG_SEND_HARD_LIMIT_MB} (лимит Bot API на загрузку файлов ботом)")

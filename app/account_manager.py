@@ -18,6 +18,7 @@ app/account_manager.py
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -287,9 +288,19 @@ class AccountManager:
                 tmp_dir=self.cfg.tmp_dir, max_image_bytes=self.cfg.max_image_bytes,
             )
             browser = AccountBrowser(self.cfg, account_id=acc.id, account_name=acc.name)
-            await browser.start()
-            maxweb = MaxWeb(browser.page, self.cfg, target)
-            state = await maxweb.goto_home()
+            try:
+                await browser.start()
+                maxweb = MaxWeb(browser.page, self.cfg, target)
+                state = await maxweb.goto_home()
+            except asyncio.CancelledError:
+                # админ нажал «отмена», пока стартовал Chromium: без очистки
+                # останется сиротой процесс + занятый профиль аккаунта
+                self._log.warning("begin_auth #%d отменён — гашу браузер-сироту", account_id)
+                with contextlib.suppress(Exception):
+                    await browser.stop()
+                self.store.update_account(
+                    account_id, status="stopped" if is_new else acc.status)
+                raise
 
             session = AuthSession(account=acc, is_new=is_new, browser=browser, maxweb=maxweb)
             session.idle_task = asyncio.create_task(self._auth_idle_guard(account_id))

@@ -370,13 +370,29 @@ class MaxWeb:
             return self.page.url
 
     async def screenshot(self, kind: str) -> Path:
-        """Скриншот в cfg.screenshots_dir; путь возвращаем для отправки в TG."""
+        """Скриншот в cfg.screenshots_dir; путь возвращаем для отправки в TG.
+
+        v2.2.1: по умолчанию JPEG (quality=SHOT_QUALITY, 1440x900 -> 150-250 КБ
+        вместо 1.5-2 МБ PNG). Это не косметика: скриншоты отправляются админу
+        в Telegram через ретранслятор, и 2 МБ на 30 КБ/с = 60 с таймаут.
+        """
+        cfg = self.cfg
         self.cfg.screenshots_dir.mkdir(parents=True, exist_ok=True)
+        ext = "jpg" if cfg.shot_jpeg else "png"
         path = self.cfg.screenshots_dir / (
-            f"auth_{self.label}_{kind}_{datetime.now():%H%M%S}.png"
+            f"auth_{self.label}_{kind}_{datetime.now():%H%M%S}.{ext}"
         )
         try:
-            await self.page.screenshot(path=str(path), full_page=False)
+            if cfg.shot_jpeg:
+                await self.page.screenshot(path=str(path), type="jpeg",
+                                           quality=cfg.shot_quality, full_page=False)
+            else:
+                await self.page.screenshot(path=str(path), full_page=False)
+            try:
+                size_kb = path.stat().st_size // 1024
+            except OSError:
+                size_kb = -1
+            self._log.debug("Скриншот %s (%d КБ)", path.name, size_kb)
         except PWError as exc:
             self._log.warning("Скриншот не сделан: %s", exc)
             raise
@@ -762,7 +778,11 @@ class MaxWeb:
             box = await self.page.evaluate(_JS_IMG_BOX, src)
             if not box:
                 return None
-            png = await self.page.screenshot(clip=box, type="png", timeout=15_000)
+            png = await self.page.screenshot(
+                clip=box,
+                type="jpeg" if self.cfg.shot_jpeg else "png",
+                quality=self.cfg.shot_quality if self.cfg.shot_jpeg else None,
+                timeout=15_000)
             if len(png) > self.acct.max_image_bytes:
                 self._log.warning("Скриншот картинки больше лимита")
                 return None

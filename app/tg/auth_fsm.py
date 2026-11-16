@@ -21,6 +21,9 @@ app/tg/auth_fsm.py
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -66,6 +69,13 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
     async def _cancel(message: Message, state: FSMContext) -> None:
         data = await state.get_data()
         account_id = data.get("account_id")
+        task = data.get("auth_task")
+        if task is not None and not task.done():
+            # старт Chromium ещё идёт: отменяем, иначе begin_auth вернёт
+            # сессию, которую никто не закроет (профиль аккаунта занят)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         await state.clear()
         if account_id:
             note = await mgr.auth_abort(account_id, "отменено администратором")
@@ -87,6 +97,55 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             f"  Пример: {italic('Школа 5Б')}\n"
             f"  {CANCEL_HINT}", parse_mode=HTML)
 
+    # ------------------------------------------------- старт браузера (фон)
+    # v2.2.1: Chromium стартовал ПРЯМО В ХЕНДЛЕРЕ update'а: begin_auth занимает
+    # ~40 с (запуск процессора + persistent context), update блокировался,
+    # FSM-состояние ставилось только после — админ печатал «me» и 40 секунд
+    # не видел ничего. Теперь: состояние ставим мгновенно, браузер поднимаем
+    # задачей, промпт присылаем по её завершении.
+    async def _launch_browser(chat_id: int, state: FSMContext,
+                              account_id: int, *, is_new: bool) -> None:
+        await state.set_state(AuthFlow.phone)
+        await state.update_data(account_id=account_id, is_new=is_new,
+                                phase="starting", auth_task=None)
+        task = asyncio.create_task(mgr.begin_auth(account_id, is_new=is_new))
+        await state.update_data(auth_task=task)
+        await tg.bot.send_message(
+            chat_id,
+            f"{label} ⏳ Поднимаю изолированный Chromium (холодный старт — "
+            "до 40 c). Номер телефона пришлёте, как только я напишу «страница "
+            "входа открыта».")
+        task.add_done_callback(
+            lambda t: asyncio.create_task(_browser_ready(t, chat_id, state, is_new)))
+
+    async def _browser_ready(task: asyncio.Task, chat_id: int,
+                             state: FSMContext, is_new: bool) -> None:
+        try:
+            home = task.result()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Браузер авторизации не стартовал")
+            await state.update_data(phase="failed", browser_error=str(exc))
+            await tg.bot.send_message(
+                chat_id,
+                f"⚠️ Браузер входа не стартовал: {exc}\n"
+                "Отправьте «отмена», чтобы свернуть, или повторите вход "
+                "через /admin.")
+            return
+        data = await state.get_data()
+        if data.get("phase") != "starting":
+            return          # админ уже отменил/перешёл — промпт не нужен
+        await state.update_data(phase="ready", home_state=home)
+
+        pending = (data.get("pending_phone") or "").strip()
+        if pending:
+            # номер ввели, пока Chromium стартовал — вводим его сразу
+            await state.update_data(pending_phone=None)
+            await tg.bot.send_message(chat_id, f"{label} Страница готова, ввожу номер…")
+            await _do_phone(chat_id, state, account_id=data["account_id"],
+                            raw=pending)
+            return
+        await chat_prompt_phone(chat_id, state, home, relogin=not is_new)
+
     # ============================================================== RELOGIN
     async def start_relogin(chat_id: int, state: FSMContext, account_id: int) -> str:
         """Возвращает 'ok' (запрашиваем телефон) или текст ошибки."""
@@ -94,14 +153,7 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
         acc = store.get_account(account_id)
         if acc is None:
             return "Аккаунт не найден."
-        await state.update_data(account_id=account_id, is_new=False,
-                                chat_title=acc.max_chat_title)
-        try:
-            state_name = await mgr.begin_auth(account_id, is_new=False)
-        except Exception as exc:  # noqa: BLE001
-            return f"Не удалось начать вход: {exc}"
-        await state.set_state(AuthFlow.phone)
-        await chat_prompt_phone(chat_id, state, state_name, relogin=True)
+        await _launch_browser(chat_id, state, account_id, is_new=False)
         return "ok"
 
     async def chat_prompt_phone(chat_id: int, state: FSMContext,
@@ -194,16 +246,8 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             await message.answer(f"⚠️ {exc}")
             return
 
-        await state.update_data(account_id=acc.id, is_new=True)
-        try:
-            home = await mgr.begin_auth(acc.id, is_new=True)
-        except Exception as exc:  # noqa: BLE001
-            await message.answer(f"⚠️ Браузер входа не стартовал: {exc}")
-            await mgr.delete_account(acc.id)
-            await state.clear()
-            return
-        await state.set_state(AuthFlow.phone)
-        await chat_prompt_phone(message.chat.id, state, home, relogin=False)
+        # Chromium поднимается фоном: хендлер обязан отработать за доли секунды
+        await _launch_browser(message.chat.id, state, acc.id, is_new=True)
 
     # -------------------------------------------------------- шаг: ТЕЛЕФОН
     @router.message(AuthFlow.phone)
@@ -218,32 +262,56 @@ def register(router: Router, cfg: Config, store: Store, tg: TelegramCore,
             await state.clear()
             await message.answer("Сессия потерялась — начните заново (/admin → Добавить).")
             return
-        try:
-            phone = normalize_phone(message.text or "")
-        except ValueError as exc:
-            await message.answer(f"⚠️ {exc}")
+
+        # номер мог прийти раньше, чем браузер поднялся — не теряем его:
+        phase = data.get("phase", "ready")
+        if phase == "starting":
+            await message.answer(
+                f"{label} Браузер ещё стартует (до 40 c) — номер принял, "
+                "введу его, как только страница будет готова.")
+            await state.update_data(pending_phone=message.text)
+            return
+        if phase == "failed":
+            await message.answer(
+                f"⚠️ Браузер не стартовал ({data.get('browser_error', '?')}). "
+                "Отправьте «отмена» и повторите через /admin.")
             return
 
-        await message.answer(f"{label} Ввожу номер на странице…")
+        await _do_phone(message.chat.id, state, account_id=account_id,
+                        raw=message.text or "")
+
+    async def _do_phone(chat_id: int, state: FSMContext, *, account_id: int,
+                        raw: str) -> None:
+        """Ввод номера + скриншот + запрос кода. Общий путь для «номер сразу»
+        и «номер прислали раньше, чем поднялся браузер» (pending_phone)."""
+        try:
+            phone = normalize_phone(raw)
+        except ValueError as exc:
+            await tg.bot.send_message(chat_id, f"⚠️ {exc}")
+            return
+
+        await tg.bot.send_message(chat_id, f"{label} Ввожу номер на странице…")
         try:
             shot, captcha = await mgr.auth_submit_phone(account_id, phone)
         except Exception as exc:  # noqa: BLE001
-            await _fail(message, state, f"Ввод телефона не удался: {exc}",
-                        account_id=account_id, is_new=data.get("is_new", False))
+            await tg.bot.send_message(
+                chat_id, f"⚠️ Ввод телефона не удался: {exc}\n{CANCEL_HINT}")
             return
 
         await _screenshot_to_admin(
-            message.chat.id, shot,
+            chat_id, shot,
             "После ввода номера. Всё ок? Пришлите код из СМС (или 'отмена').")
 
         if captcha:
-            await message.answer(
-                f"⚠️ Похоже на капчу/QR — автоввод кода может не сработать.\n"
+            await tg.bot.send_message(
+                chat_id,
+                "⚠️ Похоже на капчу/QR — автоввод кода может не сработать.\n"
                 "Варианты: попробовать код ещё раз, либо пройти капчу вручную "
                 "через VNC (см. README «Авторизация с глазками»).",
                 reply_markup=_kb_with([auth_captcha_row(), auth_cancel_row()]))
         else:
-            await message.answer(
+            await tg.bot.send_message(
+                chat_id,
                 f"{label} Пришлите {bold('код из СМС')} (цифры).\n"
                 "«повторить» — запросить новый код, «отмена» — свернуть.",
                 parse_mode=HTML,

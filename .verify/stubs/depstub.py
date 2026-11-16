@@ -73,7 +73,7 @@ _mk("aiogram.client.session")
 _mk("aiogram.client.session.aiohttp",
     AiohttpSession=type("A", (), {"__init__": lambda s, **k: None}))
 _mk("aiogram.exceptions", TelegramBadRequest=PwErr, TelegramRetryAfter=PwErr,
-    TelegramForbiddenError=PwErr)
+    TelegramForbiddenError=PwErr, TelegramNetworkError=PwErr)
 _mk("aiogram.filters", Command=PH, CommandStart=PH, StateFilter=type(
     "StateFilter", (), {"__init__": lambda s, *a, **k: None,
     "__invert__": lambda s: PH(), "__call__": lambda s, *a, **k: False}))
