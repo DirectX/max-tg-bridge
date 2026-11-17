@@ -1,8 +1,8 @@
 # ============================================================================
-#  tgapi.geoctx.com — реверс-прокси Telegram Bot API для max-tg-bridge
-#  Проверен на nginx 1.24.0 против живого api.telegram.org:
-#  getMe настоящего бота -> 200 (~50 мс), /file -> 404 JSON от Bot API.
-#  Прежний рабочий вариант сохранён рядом как *.bak (референс).
+#  tgapi.<домен> — реверс-прокси Telegram Bot API для max-tg-bridge
+#  ШАБЛОН. Проверен на nginx 1.24.0 против живого api.telegram.org:
+#  getMe настоящего бота -> 200 (~50 мс), /file -> 404 JSON от Bot API,
+#  путь мимо префикса -> 444, access-лог без токена и без префикса.
 # ============================================================================
 #  Мост ходит по ДВУМ путям Bot API:
 #    /bot<token>/<method>      все вызовы API (sendMessage, getUpdates, getFile)
@@ -19,10 +19,28 @@
 #   * proxy_ssl_verify on: сертификат api.telegram.org валиден системному CA
 #     (GoDaddy, Verify return code: 0) — off только скрывал бы MITM;
 #   * proxy_request_buffering off: документ 50 МБ не пишется на диск прокси
-#     (диск этого VPS занят на 92%);
+#     (на VPS с занятым диском это прямой путь к 500 при бэкапе);
 #   * «listen ... ssl http2»: отдельная директива «http2 on;» появилась только
 #     в nginx 1.25.1, на 1.24 она даёт [emerg] unknown directive "http2".
 # ============================================================================
+
+# ---------------------------------------------------------------------------
+#  ПЕРЕД УСТАНОВКОЙ ЗАМЕНИТЬ ПЛЕЙСХОЛДЕРЫ
+# ---------------------------------------------------------------------------
+#    Плейсхолдер префикса (ниже) — свой длинный случайный ключ пути,
+#                     РОВНО 5 вхождений: 3 в map + location + rewrite.
+#                     Контроль после подстановки: grep -c по этому имени
+#                     должно дать 0. ПОРЯДОК ВАЖЕН: заменить надо ВСЕ пять —
+#                     при частичной подстановке конфиг формально валиден
+#                     (nginx -t проходит), но трафик перестаёт совпадать с
+#                     location и весь уходит в 444: мост умолкает без единой
+#                     ошибки в логе моста.
+#    example.com    — ваш домен (server_name, пути сертификата, имена логов).
+#
+#  Пост-установочная проверка (README §3.2, шаг 6) ловит именно случай
+#  частичной подстановки: curl getMe через прокси обязан вернуть
+#  {"ok":true,...}, а не пустой ответ/444.
+# ---------------------------------------------------------------------------
 
 # Кэш DNS Telegram через чистый резолвер, а не региональный/отравленный.
 resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
@@ -36,11 +54,11 @@ resolver_timeout 5s;
 # со следующим символом («$fbot» вместо «$f»+«bot») и падает в [emerg].
 map $request_uri $safe_uri {
     default                                        $request_uri;
-    "~^/Eak0ibu6eoj8The6IMeimeoch5nuo7ae/file/(?<b>bot\\d+:[^/]+)(?<m>/.*)$"
+    "~^/SECRET_PREFIX/file/(?<b>bot\\d+:[^/]+)(?<m>/.*)$"
                                                    "/<secret>/file/bot<token>${m}";
-    "~^/Eak0ibu6eoj8The6IMeimeoch5nuo7ae/(?<b>bot\\d+:[^/]+)(?<m>/.*)$"
+    "~^/SECRET_PREFIX/(?<b>bot\\d+:[^/]+)(?<m>/.*)$"
                                                    "/<secret>/bot<token>${m}";
-    "~^/Eak0ibu6eoj8The6IMeimeoch5nuo7ae(?<rest>/.*)$"
+    "~^/SECRET_PREFIX(?<rest>/.*)$"
                                                    "/<secret>${rest}";
     "~^/file/(?<b>bot\\d+:[^/]+)(?<m>/.*)$"        "/file/bot<token>${m}";
     "~^/(?<b>bot\\d+:[^/]+)(?<m>/.*)$"             "/bot<token>${m}";
@@ -56,9 +74,10 @@ server {
     listen [::]:443 ssl http2;
     server_name tgapi.example.com;
 
-    # Cloudflare ORIGIN-сертификат (SAN *.example.com): доверяется только
-    # Cloudflare. Прокси в CF должен быть Full или Strict (не Flexible):
-    # весь живой трафик ходил на https:443, так что режим уже правильный.
+    # Cloudflare ORIGIN-сертификат (SAN *.домен): доверяется только Cloudflare,
+    # публичным CA — нет. Поэтому режим прокси в дашборде CF обязан быть
+    # Full или Strict (НЕ Flexible: Flexible ходит на origin по HTTP:80, и
+    # этот сертификат там не сработает).
     ssl_certificate     /etc/nginx/ssl/example.com.pem;
     ssl_certificate_key /etc/nginx/ssl/example.com.key;
     ssl_protocols       TLSv1.2 TLSv1.3;
