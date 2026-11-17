@@ -1,0 +1,151 @@
+# ============================================================================
+#  tgapi.geoctx.com — реверс-прокси Telegram Bot API для max-tg-bridge
+#  Проверен на nginx 1.24.0 против живого api.telegram.org:
+#  getMe настоящего бота -> 200 (~50 мс), /file -> 404 JSON от Bot API.
+#  Прежний рабочий вариант сохранён рядом как *.bak (референс).
+# ============================================================================
+#  Мост ходит по ДВУМ путям Bot API:
+#    /bot<token>/<method>      все вызовы API (sendMessage, getUpdates, getFile)
+#                              и ЗАГРУЗКА фото/документов (multipart сюда же)
+#    /file/bot<token>/<path>   скачивание того, что прислали боту (фото Владельца)
+#  ОДИН location ниже покрывает оба пути.
+#
+#  Ключевые решения (подробный разбор ловушек — в telegram-api.conf.example):
+#   * rewrite + переменная вместо статического proxy_pass: секретный префикс
+#     срезается, а DNS Telegram пере-резолвится на ходу (IP плавающие; в *.bak
+#     резолв был один раз на старт — смена IP вешала прокси до перезагрузки);
+#   * set ОБЯЗАТЕЛЬНО ДО rewrite break — наоборот даст 500 на каждом запросе
+#     ([error] invalid URL prefix in "");
+#   * proxy_ssl_verify on: сертификат api.telegram.org валиден системному CA
+#     (GoDaddy, Verify return code: 0) — off только скрывал бы MITM;
+#   * proxy_request_buffering off: документ 50 МБ не пишется на диск прокси
+#     (диск этого VPS занят на 92%);
+#   * «listen ... ssl http2»: отдельная директива «http2 on;» появилась только
+#     в nginx 1.25.1, на 1.24 она даёт [emerg] unknown directive "http2".
+# ============================================================================
+
+# Кэш DNS Telegram через чистый резолвер, а не региональный/отравленный.
+resolver 1.1.1.1 8.8.8.8 valid=300s ipv6=off;
+resolver_timeout 5s;
+
+# Access-лог БЕЗ секретов. Префикс поворачивается владельцем, а ТОКЕН —
+# полноценный пароль к боту: его утечка из access-лога (ротация, архивы,
+# Cloudflare, читается шире, чем .env) равна перехвату всех сообщений бота.
+# Порядок правил — от частного к общему: в map выигрывает ПЕРВОЕ совпадение.
+# Подстановка только через ${...}: без скобок nginx склеивает имя переменной
+# со следующим символом («$fbot» вместо «$f»+«bot») и падает в [emerg].
+map $request_uri $safe_uri {
+    default                                        $request_uri;
+    "~^/Eak0ibu6eoj8The6IMeimeoch5nuo7ae/file/(?<b>bot\\d+:[^/]+)(?<m>/.*)$"
+                                                   "/<secret>/file/bot<token>${m}";
+    "~^/Eak0ibu6eoj8The6IMeimeoch5nuo7ae/(?<b>bot\\d+:[^/]+)(?<m>/.*)$"
+                                                   "/<secret>/bot<token>${m}";
+    "~^/Eak0ibu6eoj8The6IMeimeoch5nuo7ae(?<rest>/.*)$"
+                                                   "/<secret>${rest}";
+    "~^/file/(?<b>bot\\d+:[^/]+)(?<m>/.*)$"        "/file/bot<token>${m}";
+    "~^/(?<b>bot\\d+:[^/]+)(?<m>/.*)$"             "/bot<token>${m}";
+}
+
+log_format tgq_safe '$time_iso8601 $remote_addr "$request_method" $safe_uri '
+                    'status=$status out=$body_bytes_sent req=$request_time '
+                    'up=$upstream_response_time upaddr=$upstream_addr '
+                    'proto=$server_protocol';
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name tgapi.example.com;
+
+    # Cloudflare ORIGIN-сертификат (SAN *.example.com): доверяется только
+    # Cloudflare. Прокси в CF должен быть Full или Strict (не Flexible):
+    # весь живой трафик ходил на https:443, так что режим уже правильный.
+    ssl_certificate     /etc/nginx/ssl/example.com.pem;
+    ssl_certificate_key /etc/nginx/ssl/example.com.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:SSL_TG:10m;
+    ssl_session_timeout 1d;
+
+    # Загрузка в Bot API: фото <=10 МБ, документ <=50 МБ (наш бэкап .tar.gz).
+    # 64m с запасом — больше Telegram всё равно не примет.
+    client_max_body_size  64m;
+    client_body_timeout   120s;
+    client_header_timeout 30s;
+
+    # Настоящий IP клиента: без этого в логе только адреса Cloudflare
+    # (162.158.x / 172.68.x / 104.16.x), и разбирать инциденты невозможно.
+    # Диапазоны: https://www.cloudflare.com/ips/ — обновлять периодически.
+    set_real_ip_from 173.245.48.0/20;
+    set_real_ip_from 103.21.244.0/22;
+    set_real_ip_from 103.22.200.0/22;
+    set_real_ip_from 103.31.4.0/22;
+    set_real_ip_from 141.101.64.0/18;
+    set_real_ip_from 108.162.192.0/18;
+    set_real_ip_from 190.93.240.0/20;
+    set_real_ip_from 188.114.96.0/20;
+    set_real_ip_from 197.234.240.0/22;
+    set_real_ip_from 198.41.128.0/17;
+    set_real_ip_from 162.158.0.0/15;
+    set_real_ip_from 104.16.0.0/13;
+    set_real_ip_from 104.24.0.0/14;
+    set_real_ip_from 172.64.0.0/13;
+    set_real_ip_from 131.0.72.0/22;
+    real_ip_header CF-Connecting-IP;
+
+    access_log /var/log/nginx/tgapi.example.com.access.log tgq_safe;
+    error_log  /var/log/nginx/tgapi.example.com.error.log warn;
+
+    # ЕДИНСТВЕННЫЙ location: покрывает и /bot<token>/<method>, и /file/…
+    # (regex-вид «/(?:bot|file)/» здесь НЕ годится: у методов нет слэша после
+    # «bot» — /bot123:ABC/getMe, так что он ловил бы только /file.)
+    location /SECRET_PREFIX/ {
+        # *** ПОРЯДОК КРИТИЧЕН: set ДО rewrite break (см. шапку) ***
+        set $tg_backend "https://api.telegram.org";
+        rewrite ^/SECRET_PREFIX(/.*)$ $1 break;
+        proxy_pass $tg_backend;
+
+        proxy_ssl_server_name         on;
+        proxy_ssl_name                api.telegram.org;
+        proxy_ssl_protocols           TLSv1.2 TLSv1.3;
+        proxy_ssl_verify              on;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+        proxy_ssl_verify_depth        3;
+        proxy_ssl_session_reuse       on;
+
+        proxy_set_header Host              api.telegram.org;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        # Стримим тело запроса в Telegram без временных файлов на диске.
+        proxy_request_buffering off;
+        proxy_buffering         off;
+
+        proxy_connect_timeout 10s;
+        proxy_send_timeout    180s;   # загрузка 50 МБ на медленном канале
+        proxy_read_timeout    180s;   # long-poll getUpdates держит соединение
+
+        # IP Telegram плавающие: при сбое соединения пере-резолвим и повторим.
+        # non_idempotent НЕ включаем: повтор POST с уже отданным потоком телом
+        # невозможен, а getUpdates aiogram повторяет сам.
+        proxy_next_upstream         error timeout http_502 http_503 http_504;
+        proxy_next_upstream_tries   2;
+        proxy_next_upstream_timeout 20s;
+    }
+
+    # Всё остальное — закрытие соединения БЕЗ ответа (444): сканер не получает
+    # ни статуса, ни баннера, ни подсказки, что здесь что-то есть.
+    location / { return 444; }
+}
+
+# HTTP -> HTTPS. Порт 80 занят default_server'ом — это легально: несколько
+# server-блоков на одном порту различаются по server_name (для :80 SNI не нужен).
+server {
+    listen 80;
+    listen [::]:80;
+    server_name tgapi.example.com;
+    return 301 https://$host$request_uri;
+}

@@ -193,8 +193,77 @@ Bot API отвечает на **два разных пути**, и мост по
 [`nginx/telegram-api.conf.example`](nginx/telegram-api.conf.example) — один
 `location` покрывает оба пути (с секретным префиксом или без, режимы A/B);
 в шапке файла разобраны ловушки с резкой префикса и порядком директив.
+Боевой вариант для домена за Cloudflare с секретным префиксом —
+[`nginx/tgapi.example.com.production`](nginx/tgapi.example.com.production)
+(валидирован против живого Bot API: `getMe` → 200, `/file` → 404 JSON,
+access-лог без токена и префикса). Установка: раздел 3.2.
 
-**Сторонний ретранслятор** (`TG_API_BASE` вида `https://host/ключ`, например geoctx):
+### 3.2. Установка/починка реверс-прокси (пошагово)
+
+Проверено на Ubuntu 24.04 / nginx 1.24.0. Конфиг **валидируется в песочной
+копии** до касательства к проду: `nginx -t` не проверяет bind портов, а
+ошибка «Address already in use» всплывает только при старте.
+
+```bash
+# 0. Диагноз: почему не поднимается (обычно [emerg] в sites-enabled/tgapi…)
+systemctl status nginx --no-pager | head -12
+nginx -t 2>&1 | tail -3
+
+# 1. Убедиться, что порт 80/443 не держит мусорный процесс (например,
+#    забытый тестовый стенд: nginx -c /tmp/…). Прод-nginx в failed —
+#    значит слушать порты может кто угодно другой.
+ss -ltnp | grep -E ':80 |:443 '
+pgrep -af 'nginx' | grep -v 'sshd'
+
+# 2. Резервная копия текущего (пусть и битого) конфига
+cp -a /etc/nginx/sites-available/tgapi.example.com{,.broken.$(date +%F_%H%M)}
+
+# 3. Установка нового конфига: В sites-available И в sites-enabled.
+#    Если sites-enabled/tgapi… — обычная копия (не симлинк), её тоже нужно
+#    перезаписать: nginx читает sites-enabled/*, и рассинхрон даёт старую
+#    ошибку при обновлённом sites-available.
+install -m644 tgapi.example.com.production \
+        /etc/nginx/sites-available/tgapi.example.com
+install -m644 tgapi.example.com.production \
+        /etc/nginx/sites-enabled/tgapi.example.com   # или ln -sf, см. шаг 3б
+
+# 3б. (альтернатива) симлинк вместо копии:
+#     ln -sfn /etc/nginx/sites-available/tgapi.example.com \
+#             /etc/nginx/sites-enabled/tgapi.example.com
+
+# 4. Валидация ВСЕЙ конфигурации (все сайты), а не только нашего блока
+nginx -t 2>&1 | tail -2
+
+# 5. Запуск
+systemctl start nginx && systemctl status nginx --no-pager | head -6
+
+# 6. Проверка канала: путь срезается, Telegram отвечает, лог без секретов
+SEC=<ваш секретный префикс>
+curl -s -XPOST "https://tgapi.example.com/$SEC/bot<TOKEN>/getMe" | head -c 120
+curl -s  "https://tgapi.example.com/$SEC/file/bot<TOKEN>/probe.jpg" -o /dev/null -w "%{http_code}\n"
+curl -sk -o /dev/null "https://tgapi.example.com/bot<TOKEN>/getMe"  # мимо префикса
+tail -3 /var/log/nginx/tgapi.example.com.access.log                 # <secret>/bot<token>
+
+# 7. Мост: TG_API_BASE НЕ меняется (префикс сохранён) — просто перезапустить
+docker compose restart bridge
+```
+
+**Откат:** `cp -a /etc/nginx/sites-available/tgapi.example.com.broken.<stamp>
+/etc/nginx/sites-enabled/tgapi.example.com && nginx -t && systemctl restart nginx`.
+
+**Поворот секретного префикса** (токен светился в старых логах — при желании):
+сгенерировать новый, заменить его в конфиге в трёх местах (`location`,
+`rewrite`, `map`), затем `TG_API_BASE` в `.env` моста, `nginx -t`,
+`systemctl reload nginx`, `docker compose restart bridge`.
+
+**Важно про Cloudflare:** сертификат — Origin (`*.example.com`, издатель
+Cloudflare), он доверяется только CF, поэтому режим в дашборде обязан быть
+**Full** или **Strict** (не Flexible). Директивы `set_real_ip_from` +
+`real_ip_header CF-Connecting-IP` возвращают в лог настоящие IP клиентов;
+бонус — прямой доступ мимо CF (подмена DNS/сканеры) отсекается: без заголовка
+CF nginx видит 0.0.0.0, он не входит в диапазоны, и запрос уходит в 444.
+
+**Сторонний ретранслятор** (`TG_API_BASE` вида `https://host/ключ`, например example):
 пути раздаёт сервис, а не вы. Проверьте в его документации, проксирует ли он
 `/file`; если нет — фото из Telegram недоступны **по вине прокси**, и лечится
 это только сменой прокси или своим Nginx. Текст при этом работает.
