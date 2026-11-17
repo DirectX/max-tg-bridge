@@ -10,3 +10,4 @@ venv/
 .verify/pytestlibs/
 .pytest_cache/
 .test_js_bridge.js
+dsh-prompts/
